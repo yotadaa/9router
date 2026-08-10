@@ -51,9 +51,15 @@ function parseJobTokenExpiry(data) {
     if (!Number.isNaN(parsed)) return parsed;
   }
 
-  const expiresInSeconds = Number(data?.expires_in);
-  if (Number.isFinite(expiresInSeconds) && expiresInSeconds > 0) {
-    return Date.now() + expiresInSeconds * 1000;
+  const expiresIn = Number(data?.expires_in);
+  if (Number.isFinite(expiresIn) && expiresIn > 0) {
+    // Qoder has returned both seconds (3600) and milliseconds (86400000)
+    // in this field. Values longer than one week are treated as milliseconds;
+    // the absolute expires_at above remains authoritative when present.
+    const durationMs = expiresIn > 7 * 24 * 60 * 60
+      ? expiresIn
+      : expiresIn * 1000;
+    return Date.now() + durationMs;
   }
 
   return Date.now() + DEFAULT_JOB_TOKEN_TTL_MS;

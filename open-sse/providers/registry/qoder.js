@@ -1,6 +1,7 @@
 import {
   QODER_ACTIVITY_URL,
   QODER_ACTIVITY_URL_ALT,
+  QODER_QUOTA_USAGE_URL,
 } from "../../shared/qoder/constants.js";
 
 export default {
@@ -27,8 +28,9 @@ export default {
     timeoutMs: 120000,
     stallTimeoutMs: 120000,
     usage: {
-      url: QODER_ACTIVITY_URL,
-      jobTokenUrl: QODER_ACTIVITY_URL_ALT,
+      url: QODER_QUOTA_USAGE_URL,
+      activityUrl: QODER_ACTIVITY_URL,
+      jobTokenActivityUrl: QODER_ACTIVITY_URL_ALT,
     },
   },
   models: [
@@ -53,6 +55,7 @@ export default {
     deviceTokenUrl: "https://openapi.qoder.sh/api/v1/deviceToken/poll",
     refreshUrl: "https://center.qoder.sh/algo/api/v3/user/refresh_token",
     userInfoUrl: "https://openapi.qoder.sh/api/v1/userinfo",
+    quotaUsageUrl: QODER_QUOTA_USAGE_URL,
     activityUrl: QODER_ACTIVITY_URL,
     jobTokenActivityUrl: QODER_ACTIVITY_URL_ALT,
     loginUrl: "https://qoder.com/device/selectAccounts",
