@@ -196,9 +196,6 @@ export async function getVercelAiGatewayUsage(apiKey, proxyOptions = null) {
  * Fallback: GET https://api3.qoder.sh/algo/api/v2/activity (requires COSY signing)
  */
 
-const QODER_QUOTA_USAGE_URL = "https://openapi.qoder.sh/api/v2/quota/usage";
-const QODER_ACTIVITY_URL = "https://api3.qoder.sh/algo/api/v2/activity";
-
 /** Parse numeric values safely */
 function parseNumber(value, fallback = 0) {
   if (typeof value === "number" && Number.isFinite(value)) return value;
@@ -425,6 +422,9 @@ export async function getQoderUsage(apiKey, providerSpecificData, proxyOptions =
 
   console.log("[Qoder Usage] Token received:", token);
 
+  // Initialize combined quotas object early so it's available throughout
+  const combinedQuotas = {};
+
   // Try multiple endpoints in order of preference:
   // 1. Direct PAT with simple quota endpoint (no COSY needed)
   // 2. Job token with simple quota endpoint
@@ -494,6 +494,7 @@ export async function getQoderUsage(apiKey, providerSpecificData, proxyOptions =
   }
 
   // Fetch Activity API for MODEL_FREE_QUOTA activities (800 free calls example)
+  // Note: combinedQuotas was already declared earlier and may have Credits populated
   try {
     console.log("[Qoder Usage] Fetching from activity API (/algo/api/v2/activity)...");
     const activityResponse = await proxyAwareFetch(
