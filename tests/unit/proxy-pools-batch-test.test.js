@@ -158,6 +158,7 @@ describe("server-side proxy health jobs", () => {
     expect(completed).not.toHaveProperty("results");
     expect(completed).not.toHaveProperty("failedIds");
     expect(completed).not.toHaveProperty("failedById");
+    expect(completed).not.toHaveProperty("latencyHistogram");
     expect(JSON.stringify(completed)).not.toContain("secret");
     expect(JSON.stringify(completed)).not.toContain("all-scope-0.test");
   });
@@ -236,6 +237,7 @@ describe("server-side proxy health jobs", () => {
         concurrency: 3,
         averageLatencyMs: 20,
         minLatencyMs: 10,
+        medianLatencyMs: 20,
         maxLatencyMs: 30,
         totalLatencyMs: 40,
       },
@@ -259,6 +261,88 @@ describe("server-side proxy health jobs", () => {
       expect(JSON.stringify(aggregate)).not.toContain("reachable.test");
       expect(JSON.stringify(aggregate)).not.toContain("failed.test");
     }
+  });
+
+  it("excludes skipped inactive records from the primary-start retry gate", async () => {
+    const pools = [
+      makePools(1, "active-retry")[0],
+      {
+        ...makePools(1, "inactive-skipped")[0],
+        isActive: false,
+      },
+    ];
+    dbMocks.getProxyPools.mockResolvedValue(pools);
+    networkMocks.testProxyUrl
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 504,
+        elapsedMs: 10_000,
+        error: "Proxy test timed out",
+        failureKind: "timeout",
+        retryable: true,
+        proxyFailure: true,
+        inconclusive: false,
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        targetOk: true,
+        status: 204,
+        elapsedMs: 18,
+        error: null,
+      });
+    const { GET, POST } = await loadRoute();
+
+    const start = await (await POST(makePost({
+      scope: "all",
+      includeInactive: false,
+      concurrency: 2,
+    }))).json();
+    const completed = await waitForTerminal(GET, start.jobId);
+
+    expect(networkMocks.testProxyUrl).toHaveBeenCalledTimes(2);
+    expect(networkMocks.testProxyUrl.mock.calls[0][0].proxyUrl).toBe(pools[0].proxyUrl);
+    expect(networkMocks.testProxyUrl.mock.calls[1][0]).toMatchObject({
+      proxyUrl: pools[0].proxyUrl,
+      testUrl: "https://cloudflare.com/cdn-cgi/trace",
+    });
+    expect(completed).toMatchObject({
+      status: "completed",
+      total: 2,
+      completed: 2,
+      initialStarted: 1,
+      initialCompleted: 2,
+      retryTotal: 1,
+      retryCompleted: 1,
+      pendingRetries: 0,
+      successful: 1,
+      skipped: 1,
+    });
+    expect(JSON.stringify(completed)).not.toContain("active-retry-0.test");
+    expect(JSON.stringify(completed)).not.toContain("inactive-skipped-0.test");
+    expect(JSON.stringify(completed)).not.toContain("secret");
+  });
+
+  it("keeps all successful latency aggregates within the enforced timeout bound", async () => {
+    const pools = makePools(2, "latency-bound");
+    dbMocks.getProxyPools.mockResolvedValue(pools);
+    networkMocks.testProxyUrl.mockImplementation(async ({ proxyUrl }) => ({
+      ok: true,
+      status: 200,
+      elapsedMs: proxyUrl.includes("-0.test") ? 9_990 : 10_025,
+      error: null,
+    }));
+    const { GET, POST } = await loadRoute();
+
+    const start = await (await POST(makePost({ scope: "all", concurrency: 2 }))).json();
+    const completed = await waitForTerminal(GET, start.jobId);
+
+    expect(completed.stats).toMatchObject({
+      successful: 2,
+      averageLatencyMs: 9_995,
+      minLatencyMs: 9_990,
+      medianLatencyMs: 9_995,
+      maxLatencyMs: 10_000,
+    });
   });
 
   it("time-flushes valid results while deferring failures until the environment is confirmed", async () => {
@@ -327,6 +411,7 @@ describe("server-side proxy health jobs", () => {
         averageLatencyMs: 33,
         averageAttemptMs: 30,
         minLatencyMs: 10,
+        medianLatencyMs: 40,
         maxLatencyMs: 50,
         currentRatePerSecond: expect.any(Number),
         writeDurationMs: expect.any(Number),
@@ -389,6 +474,184 @@ describe("server-side proxy health jobs", () => {
       concurrency: 64,
     });
     expect(peakInFlight).toBe(64);
+  });
+
+  it("shares the 64-probe ceiling and 25-starts-per-second budget with retries", async () => {
+    const pools = makePools(64, "shared-budget");
+    const retryProxyUrl = pools[0].proxyUrl;
+    dbMocks.getProxyPools.mockResolvedValue(pools);
+    let activeProbes = 0;
+    let peakInFlight = 0;
+    let primaryStarted = 0;
+    let releasePrimaries;
+    const primaryGate = new Promise((resolve) => { releasePrimaries = resolve; });
+    const starts = [];
+    networkMocks.testProxyUrl.mockImplementation(async ({ proxyUrl, testUrl }) => {
+      const isRetry = Boolean(testUrl);
+      starts.push({ at: Date.now(), isRetry });
+      activeProbes += 1;
+      peakInFlight = Math.max(peakInFlight, activeProbes);
+
+      if (!isRetry) {
+        primaryStarted += 1;
+        if (primaryStarted === pools.length) releasePrimaries();
+        await primaryGate;
+      }
+
+      activeProbes -= 1;
+      if (!isRetry && proxyUrl === retryProxyUrl) {
+        return {
+          ok: false,
+          status: 504,
+          elapsedMs: 10_000,
+          error: "Proxy test timed out",
+          failureKind: "timeout",
+          retryable: true,
+          proxyFailure: true,
+          inconclusive: false,
+        };
+      }
+      return { ok: true, status: 200, elapsedMs: 8, error: null };
+    });
+    const { GET, POST } = await loadRoute();
+
+    const start = await (await POST(makePost({
+      scope: "all",
+      includeInactive: true,
+      concurrency: 64,
+    }))).json();
+    const completed = await waitForTerminal(GET, start.jobId);
+
+    expect(starts).toHaveLength(65);
+    expect(starts.slice(0, 64).every(({ isRetry }) => !isRetry)).toBe(true);
+    expect(starts[64].isRetry).toBe(true);
+    expect(peakInFlight).toBe(64);
+    // Twenty-six starts require 25 inter-start intervals. The implementation
+    // schedules 40 ms spacing; 900 ms leaves room for timer granularity while
+    // still detecting an unbounded or per-lane limiter.
+    expect(starts[25].at - starts[0].at).toBeGreaterThanOrEqual(900);
+    expect(starts[64].at - starts[63].at).toBeGreaterThanOrEqual(25);
+    expect(completed).toMatchObject({
+      status: "completed",
+      total: 64,
+      successful: 64,
+      failed: 0,
+      concurrency: 64,
+      initialStarted: 64,
+      retryTotal: 1,
+      retryCompleted: 1,
+      attemptCount: 65,
+      pendingRetries: 0,
+    });
+  }, 10_000);
+
+  it("cancels probes queued behind the shared start-rate limiter without starting them", async () => {
+    dbMocks.getProxyPools.mockResolvedValue(makePools(10, "rate-cancel"));
+    let started = 0;
+    networkMocks.testProxyUrl.mockImplementation(({ signal }) => new Promise((resolve) => {
+      started += 1;
+      signal.addEventListener("abort", () => resolve({
+        ok: false,
+        cancelled: true,
+        elapsedMs: 1,
+        error: "cancelled",
+      }), { once: true });
+    }));
+    const { DELETE, GET, POST } = await loadRoute();
+
+    const start = await (await POST(makePost({ scope: "all", concurrency: 10 }))).json();
+    await waitUntil(() => started === 1);
+    await DELETE(new Request(
+      `http://localhost/api/proxy-pools/batch-test?jobId=${encodeURIComponent(start.jobId)}`,
+      { method: "DELETE" }
+    ));
+    const terminal = await waitForTerminal(GET, start.jobId);
+
+    expect(started).toBe(1);
+    expect(terminal).toMatchObject({
+      status: "cancelled",
+      total: 10,
+      completed: 10,
+      initialStarted: 1,
+      initialCompleted: 10,
+      cancelled: 10,
+      inFlight: 0,
+      pendingRetries: 0,
+      persisted: 0,
+    });
+    expect(dbMocks.bulkUpdateProxyPoolHealth).not.toHaveBeenCalled();
+  });
+
+  it("cancels retry workers waiting for a shared probe slot", async () => {
+    dbMocks.getProxyPools.mockResolvedValue(makePools(5, "slot-cancel"));
+    let primaryStarted = 0;
+    let retryNetworkStarts = 0;
+    networkMocks.testProxyUrl.mockImplementation(({ signal, testUrl }) => {
+      if (testUrl) {
+        retryNetworkStarts += 1;
+        return Promise.resolve({ ok: true, status: 200, elapsedMs: 8, error: null });
+      }
+
+      primaryStarted += 1;
+      if (primaryStarted <= 2) {
+        return Promise.resolve({
+          ok: false,
+          status: 504,
+          elapsedMs: 10_000,
+          error: "Proxy test timed out",
+          failureKind: "timeout",
+          retryable: true,
+          proxyFailure: true,
+          inconclusive: false,
+        });
+      }
+      return new Promise((resolve) => {
+        signal.addEventListener("abort", () => resolve({
+          ok: false,
+          cancelled: true,
+          elapsedMs: 1,
+          error: "cancelled",
+        }), { once: true });
+      });
+    });
+    const { DELETE, GET, POST } = await loadRoute();
+
+    const start = await (await POST(makePost({ scope: "all", concurrency: 3 }))).json();
+    const waiting = await waitForSnapshot(
+      GET,
+      start.jobId,
+      (snapshot) => (
+        snapshot.initialStarted === 5
+        && snapshot.initialCompleted === 2
+        && snapshot.pendingRetries === 2
+        && snapshot.inFlight === 3
+      )
+    );
+    expect(waiting.retryCompleted).toBe(0);
+    expect(retryNetworkStarts).toBe(0);
+
+    await DELETE(new Request(
+      `http://localhost/api/proxy-pools/batch-test?jobId=${encodeURIComponent(start.jobId)}`,
+      { method: "DELETE" }
+    ));
+    const terminal = await waitForTerminal(GET, start.jobId);
+
+    expect(retryNetworkStarts).toBe(0);
+    expect(terminal).toMatchObject({
+      status: "cancelled",
+      total: 5,
+      completed: 5,
+      initialStarted: 5,
+      initialCompleted: 5,
+      retryTotal: 2,
+      retryCompleted: 0,
+      retryCancelled: 2,
+      pendingRetries: 0,
+      cancelled: 5,
+      inFlight: 0,
+      persisted: 0,
+    });
+    expect(dbMocks.bulkUpdateProxyPoolHealth).not.toHaveBeenCalled();
   });
 
   it("stops a running server job, aborts in-flight checks, and keeps saved work", async () => {

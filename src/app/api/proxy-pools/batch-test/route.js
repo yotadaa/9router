@@ -14,10 +14,9 @@ const MAX_CONCURRENCY = 64;
 const MAX_STARTS_PER_SECOND = 25;
 const MAX_SELECTED_IDS = 5_000;
 const TEST_TIMEOUT_MS = 10_000;
-const MAX_TEST_ATTEMPTS = 2;
-const TRANSIENT_RETRY_DELAY_MS = 100;
+const LATENCY_HISTOGRAM_BUCKETS = TEST_TIMEOUT_MS + 1;
 const RETRY_TEST_URL = "https://cloudflare.com/cdn-cgi/trace";
-const HEALTH_CLASSIFICATION_VERSION = 4;
+const HEALTH_CLASSIFICATION_VERSION = 8;
 const HEALTH_WRITE_BATCH_SIZE = 100;
 const HEALTH_WRITE_FLUSH_INTERVAL_MS = 500;
 const ENVIRONMENT_FAILURE_RECHECK_THRESHOLD = 256;
@@ -33,7 +32,7 @@ const healthState = globalThis.__proxyPoolHealthJobStateV2
   });
 
 // Hot reload keeps the in-memory job object and its old worker closure alive.
-// Quarantine an older one-shot classifier immediately so it cannot keep
+// Quarantine an older scheduler/classifier immediately so it cannot keep
 // writing ambiguous failures or later expose them to the disable action.
 const legacyActiveJob = healthState.activeJobId
   ? healthState.jobs.get(healthState.activeJobId)
@@ -45,7 +44,7 @@ if (
 ) {
   legacyActiveJob.cancelRequested = true;
   legacyActiveJob.status = "cancelling";
-  legacyActiveJob.error = "Legacy one-shot health check stopped after classifier upgrade";
+  legacyActiveJob.error = "Older health check stopped after scheduler upgrade";
   if (Array.isArray(legacyActiveJob.pendingWrites)) legacyActiveJob.pendingWrites.length = 0;
   if (Array.isArray(legacyActiveJob.pendingFailureWrites)) {
     legacyActiveJob.pendingFailureWrites.length = 0;
@@ -97,11 +96,17 @@ function buildJob({ scope, concurrency, includeInactive = false }) {
     classificationVersion: HEALTH_CLASSIFICATION_VERSION,
     maxStartsPerSecond: MAX_STARTS_PER_SECOND,
     status: "loading",
+    phase: "initial",
     createdAtMs,
     startedAtMs: null,
     finishedAtMs: null,
     total: 0,
     completed: 0,
+    initialStarted: 0,
+    initialCompleted: 0,
+    retryTotal: 0,
+    retryCompleted: 0,
+    retryCancelled: 0,
     successful: 0,
     failed: 0,
     skipped: 0,
@@ -111,12 +116,21 @@ function buildJob({ scope, concurrency, includeInactive = false }) {
     missing: 0,
     latencyTotalMs: 0,
     attemptDurationTotalMs: 0,
+    attemptCount: 0,
     minLatencyMs: null,
     maxLatencyMs: null,
+    latencyHistogram: new Uint32Array(LATENCY_HISTOGRAM_BUCKETS),
+    latencySampleCount: 0,
+    latencyHistogramComplete: true,
+    latencyHistogramFinalized: false,
+    medianLatencyMs: null,
     timedOut: 0,
     inFlight: 0,
     recentCompletionTimes: [],
     recentCompletionHead: 0,
+    recentInitialCompletionTimes: [],
+    recentInitialCompletionHead: 0,
+    rateWindowStartedAtMs: null,
     failedById: new Map(),
     pendingFailureWrites: [],
     pendingWrites: [],
@@ -136,6 +150,7 @@ function buildJob({ scope, concurrency, includeInactive = false }) {
     disableSummary: null,
     disableInProgress: false,
     error: null,
+    initialPhaseDone: false,
   };
 }
 
@@ -146,7 +161,57 @@ function ensureJobTelemetry(job) {
     || job.recentCompletionHead > job.recentCompletionTimes.length) {
     job.recentCompletionHead = 0;
   }
+  if (!Array.isArray(job.recentInitialCompletionTimes)) {
+    job.recentInitialCompletionTimes = [];
+  }
+  if (!Number.isInteger(job.recentInitialCompletionHead)
+    || job.recentInitialCompletionHead < 0
+    || job.recentInitialCompletionHead > job.recentInitialCompletionTimes.length) {
+    job.recentInitialCompletionHead = 0;
+  }
+  if (!Number.isFinite(job.rateWindowStartedAtMs)) {
+    job.rateWindowStartedAtMs = Number(job.startedAtMs) || null;
+  }
   if (!Number.isFinite(job.attemptDurationTotalMs)) job.attemptDurationTotalMs = 0;
+  if (!Number.isFinite(job.attemptCount) || job.attemptCount < 0) {
+    const finalizedAttempts = Number(job.successful || 0)
+      + Number(job.failed || 0)
+      + Number(job.internalErrors || 0)
+      + Number(job.retried || 0);
+    job.attemptCount = Math.max(0, finalizedAttempts);
+  }
+  if (!Number.isFinite(job.initialCompleted) || job.initialCompleted < 0) {
+    job.initialCompleted = Number(job.completed) || 0;
+  }
+  if (!Number.isFinite(job.initialStarted) || job.initialStarted < 0) {
+    job.initialStarted = Number(job.initialCompleted) || 0;
+  }
+  if (!Number.isFinite(job.retryTotal) || job.retryTotal < 0) {
+    job.retryTotal = Number(job.retried) || 0;
+  }
+  if (!Number.isFinite(job.retryCompleted) || job.retryCompleted < 0) {
+    job.retryCompleted = Number(job.retried) || 0;
+  }
+  if (!Number.isFinite(job.retryCancelled) || job.retryCancelled < 0) {
+    job.retryCancelled = 0;
+  }
+  if (job.latencyHistogramFinalized === true) {
+    if (!Number.isFinite(job.medianLatencyMs)) job.medianLatencyMs = null;
+  } else {
+    if (!(job.latencyHistogram instanceof Uint32Array)
+      || job.latencyHistogram.length !== LATENCY_HISTOGRAM_BUCKETS) {
+      job.latencyHistogram = new Uint32Array(LATENCY_HISTOGRAM_BUCKETS);
+      job.latencySampleCount = 0;
+      // An already-running pre-upgrade job cannot reconstruct earlier samples.
+      job.latencyHistogramComplete = Number(job.successful || 0) === 0;
+    }
+    if (!Number.isFinite(job.latencySampleCount) || job.latencySampleCount < 0) {
+      job.latencySampleCount = 0;
+    }
+    if (typeof job.latencyHistogramComplete !== "boolean") {
+      job.latencyHistogramComplete = job.latencySampleCount === Number(job.successful || 0);
+    }
+  }
   if (!Number.isFinite(job.timedOut)) job.timedOut = 0;
   if (!Number.isFinite(job.inFlight)) job.inFlight = 0;
   if (!Number.isFinite(job.writeQueueDepth)) job.writeQueueDepth = 0;
@@ -161,6 +226,39 @@ function ensureJobTelemetry(job) {
     );
   }
   if (job.lastPersistedAt === undefined) job.lastPersistedAt = null;
+}
+
+function recordSuccessfulLatency(job, latencyMs) {
+  ensureJobTelemetry(job);
+  if (job.latencyHistogramFinalized) return;
+  const bucket = Math.max(
+    0,
+    Math.min(TEST_TIMEOUT_MS, Math.round(Number(latencyMs) || 0)),
+  );
+  job.latencyHistogram[bucket] += 1;
+  job.latencySampleCount += 1;
+}
+
+function getMedianLatency(job) {
+  if (job.latencyHistogramFinalized === true) {
+    return Number.isFinite(job.medianLatencyMs) ? job.medianLatencyMs : null;
+  }
+  ensureJobTelemetry(job);
+  const count = job.latencySampleCount;
+  if (!job.latencyHistogramComplete || count <= 0) return null;
+
+  const leftRank = Math.floor((count - 1) / 2);
+  const rightRank = Math.floor(count / 2);
+  let seen = 0;
+  let leftValue = null;
+
+  for (let latencyMs = 0; latencyMs < job.latencyHistogram.length; latencyMs += 1) {
+    seen += job.latencyHistogram[latencyMs];
+    if (leftValue === null && seen > leftRank) leftValue = latencyMs;
+    if (seen > rightRank) return (leftValue + latencyMs) / 2;
+  }
+
+  return null;
 }
 
 function pruneRecentCompletions(job, nowMs) {
@@ -186,10 +284,48 @@ function pruneRecentCompletions(job, nowMs) {
 
 function getRecentRate(job, nowMs) {
   const recentCount = pruneRecentCompletions(job, nowMs);
+  const rateStartedAtMs = job.rateWindowStartedAtMs || job.startedAtMs;
+  const elapsedMs = rateStartedAtMs
+    ? Math.max(1_000, Math.min(RATE_WINDOW_MS, nowMs - rateStartedAtMs))
+    : RATE_WINDOW_MS;
+  return Number((recentCount / (elapsedMs / 1_000)).toFixed(1));
+}
+
+function pruneRecentInitialCompletions(job, nowMs) {
+  ensureJobTelemetry(job);
+  const cutoff = nowMs - RATE_WINDOW_MS;
+  const times = job.recentInitialCompletionTimes;
+  let head = job.recentInitialCompletionHead;
+
+  while (head < times.length && times[head] < cutoff) head += 1;
+  if (head > 1_024 || head > times.length / 2) {
+    job.recentInitialCompletionTimes = times.slice(head);
+    job.recentInitialCompletionHead = 0;
+  } else {
+    job.recentInitialCompletionHead = head;
+  }
+  return job.recentInitialCompletionTimes.length - job.recentInitialCompletionHead;
+}
+
+function recordInitialCompletion(job) {
+  ensureJobTelemetry(job);
+  const completedAtMs = Date.now();
+  job.recentInitialCompletionTimes.push(completedAtMs);
+  pruneRecentInitialCompletions(job, completedAtMs);
+}
+
+function getRecentInitialRate(job, nowMs) {
+  const recentCount = pruneRecentInitialCompletions(job, nowMs);
   const elapsedMs = job.startedAtMs
     ? Math.max(1_000, Math.min(RATE_WINDOW_MS, nowMs - job.startedAtMs))
     : RATE_WINDOW_MS;
-  return Number((recentCount / (elapsedMs / 1_000)).toFixed(1));
+  return recentCount / (elapsedMs / 1_000);
+}
+
+function resetRateWindow(job) {
+  job.recentCompletionTimes = [];
+  job.recentCompletionHead = 0;
+  job.rateWindowStartedAtMs = Date.now();
 }
 
 function snapshotJob(job) {
@@ -200,25 +336,53 @@ function snapshotJob(job) {
   const averageLatencyMs = job.successful > 0
     ? Math.round(job.latencyTotalMs / job.successful)
     : null;
-  const attempted = job.successful + job.failed + job.internalErrors;
+  const attemptCount = Number(job.attemptCount) || 0;
   const classificationReliable = job.classificationVersion === HEALTH_CLASSIFICATION_VERSION
     && job.environmentHealthy !== false;
-  const averageAttemptMs = telemetryAvailable && attempted > 0
-    ? Math.round(job.attemptDurationTotalMs / attempted)
+  const averageAttemptMs = telemetryAvailable && attemptCount > 0
+    ? Math.round(job.attemptDurationTotalMs / attemptCount)
     : null;
+  const medianLatencyMs = telemetryAvailable ? getMedianLatency(job) : null;
   const currentRatePerSecond = getRecentRate(job, endedAtMs);
-  const remaining = Math.max(0, job.total - job.completed);
-  const estimatedRemainingMs = currentRatePerSecond > 0
-    ? Math.round((remaining / currentRatePerSecond) * 1_000)
+  const phase = typeof job.phase === "string" ? job.phase : "legacy";
+  const initialStarted = Math.min(job.total, Math.max(0, Number(job.initialStarted) || 0));
+  const initialCompleted = Math.min(job.total, Math.max(0, Number(job.initialCompleted) || 0));
+  const retryTotal = Math.max(0, Number(job.retryTotal) || 0);
+  const retryCompleted = Math.min(retryTotal, Math.max(0, Number(job.retryCompleted) || 0));
+  const retryCancelled = Math.min(
+    retryTotal - retryCompleted,
+    Math.max(0, Number(job.retryCancelled) || 0)
+  );
+  const pendingRetries = Math.max(0, retryTotal - retryCompleted - retryCancelled);
+  const remaining = phase === "retrying"
+    ? pendingRetries
+    : phase === "initial"
+      ? Math.max(0, job.total - initialCompleted)
+      : Math.max(0, job.total - job.completed);
+  // A rolling primary-only rate reacts when the remaining cohort becomes a
+  // timeout-heavy tail. Cumulative throughput would keep the ETA optimistic,
+  // while the all-attempt checks/s metric would be inflated by retries.
+  const initialCompletionRate = getRecentInitialRate(job, endedAtMs);
+  const etaRate = phase === "initial" ? initialCompletionRate : currentRatePerSecond;
+  const estimatedRemainingMs = etaRate > 0
+    ? Math.round((remaining / etaRate) * 1_000)
     : null;
 
   return {
     jobId: job.id,
     status: job.status,
+    phase,
     scope: job.scope,
     includeInactive: job.includeInactive,
     total: job.total,
     completed: job.completed,
+    initialStarted,
+    initialCompleted,
+    retryTotal,
+    retryCompleted,
+    retryCancelled,
+    pendingRetries,
+    attemptCount,
     successful: job.successful,
     failed: job.failed,
     skipped: job.skipped,
@@ -254,6 +418,13 @@ function snapshotJob(job) {
     stats: {
       total: job.total,
       completed: job.completed,
+      initialStarted,
+      initialCompleted,
+      retryTotal,
+      retryCompleted,
+      retryCancelled,
+      pendingRetries,
+      attemptCount,
       successful: job.successful,
       failed: job.failed,
       skipped: job.skipped,
@@ -267,6 +438,7 @@ function snapshotJob(job) {
       averageLatencyMs,
       averageAttemptMs,
       minLatencyMs: job.minLatencyMs,
+      medianLatencyMs,
       maxLatencyMs: job.maxLatencyMs,
       totalLatencyMs: job.latencyTotalMs,
       writeDurationMs: job.writeDurationMs,
@@ -340,69 +512,135 @@ async function testPoolOnce(pool, signal, testUrl) {
     });
 }
 
-async function testPoolWithRetry(pool, signal, waitForStart) {
-  const startedAtMs = Date.now();
-  const results = [];
-  let reportedDurationMs = 0;
-  let result;
-  for (let attempt = 1; attempt <= MAX_TEST_ATTEMPTS; attempt += 1) {
-    await waitForStart();
-    if (signal.aborted) {
+function cancelledAttemptResult() {
+  return {
+    ok: false,
+    status: 499,
+    cancelled: true,
+    retryable: false,
+    proxyFailure: false,
+    inconclusive: true,
+    error: "Health check cancelled",
+    elapsedMs: 0,
+  };
+}
+
+function isInconclusiveAttempt(result, internalFailure = false) {
+  return result?.ok !== true && (
+    internalFailure
+    || result?.inconclusive === true
+    || result?.proxyFailure === false
+    || typeof result?.ok !== "boolean"
+  );
+}
+
+function recordAttemptTelemetry(job, result, durationMs) {
+  ensureJobTelemetry(job);
+  job.attemptCount += 1;
+  job.attemptDurationTotalMs += durationMs;
+  const error = typeof result?.error === "string" ? result.error : "";
+  if (result?.status === 504 || /timed out/i.test(error)) job.timedOut += 1;
+
+  const completedAtMs = Date.now();
+  job.recentCompletionTimes.push(completedAtMs);
+  pruneRecentCompletions(job, completedAtMs);
+}
+
+async function runPoolAttempt(
+  job,
+  pool,
+  waitForStart,
+  acquireProbeSlot,
+  { testUrl, onStart } = {}
+) {
+  const controller = new AbortController();
+  job.controllers.add(controller);
+  let attemptStarted = false;
+  let probeStartedAtMs = null;
+  let releaseProbeSlot = null;
+
+  try {
+    // Reserve one of the global network slots before entering the start-rate
+    // gate. Doing this in the opposite order lets queued retries consume old
+    // rate-limit timestamps and then burst when slow primaries release slots.
+    releaseProbeSlot = await acquireProbeSlot(controller.signal);
+    if (!releaseProbeSlot || job.cancelRequested || controller.signal.aborted) {
+      return {
+        result: cancelledAttemptResult(),
+        durationMs: 0,
+        internalFailure: false,
+        attemptStarted: false,
+        testedAt: new Date().toISOString(),
+      };
+    }
+
+    const startAllowed = await waitForStart(controller.signal);
+    if (!startAllowed || job.cancelRequested || controller.signal.aborted) {
+      return {
+        result: cancelledAttemptResult(),
+        durationMs: 0,
+        internalFailure: false,
+        attemptStarted: false,
+        testedAt: new Date().toISOString(),
+      };
+    }
+
+    attemptStarted = true;
+    probeStartedAtMs = Date.now();
+    ensureJobTelemetry(job);
+    job.inFlight += 1;
+    onStart?.();
+
+    let result;
+    let internalFailure = false;
+    try {
+      result = await testPoolOnce(pool, controller.signal, testUrl);
+    } catch (error) {
+      internalFailure = true;
       result = {
         ok: false,
-        status: 499,
-        cancelled: true,
+        elapsedMs: 0,
         retryable: false,
         proxyFailure: false,
         inconclusive: true,
-        error: "Health check cancelled",
-        elapsedMs: 0,
+        error: sanitizeError(error?.message, "Internal health-check error"),
       };
-      results.push(result);
-      break;
     }
 
-    const probeStartedAtMs = Date.now();
-    result = await testPoolOnce(
-      pool,
-      signal,
-      attempt > 1 ? RETRY_TEST_URL : undefined
-    );
-    results.push(result);
-    reportedDurationMs += Math.max(
+    // Avg attempt measures only network-probe time, excluding the queue behind
+    // the start-rate limiter. The transport-reported duration is preferred.
+    const durationMs = Math.max(
       0,
       Number(result?.elapsedMs) || (Date.now() - probeStartedAtMs)
     );
-    if (
-      signal.aborted
-      || result?.cancelled
-      || result?.retryable !== true
-      || attempt === MAX_TEST_ATTEMPTS
-    ) {
-      break;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, TRANSIENT_RETRY_DELAY_MS));
+    recordAttemptTelemetry(job, result, durationMs);
+    return {
+      result,
+      durationMs,
+      internalFailure,
+      attemptStarted: true,
+      testedAt: new Date().toISOString(),
+    };
+  } catch (error) {
+    return {
+      result: {
+        ok: false,
+        elapsedMs: 0,
+        retryable: false,
+        proxyFailure: false,
+        inconclusive: true,
+        error: sanitizeError(error?.message, "Internal health-check error"),
+      },
+      durationMs: probeStartedAtMs === null ? 0 : Math.max(0, Date.now() - probeStartedAtMs),
+      internalFailure: true,
+      attemptStarted,
+      testedAt: new Date().toISOString(),
+    };
+  } finally {
+    job.controllers.delete(controller);
+    if (attemptStarted) job.inFlight = Math.max(0, job.inFlight - 1);
+    releaseProbeSlot?.();
   }
-
-  const succeeded = result?.ok === true;
-  if (!succeeded && results.length > 1) {
-    const hasInconclusiveAttempt = results.some((attemptResult) => (
-      attemptResult?.inconclusive === true || attemptResult?.proxyFailure === false
-    ));
-    if (hasInconclusiveAttempt) {
-      result = { ...result, inconclusive: true, proxyFailure: false };
-    }
-  }
-
-  return {
-    result,
-    attempts: results.length,
-    // Avg attempt measures time inside the network probes, excluding time spent
-    // queued behind the server start-rate limiter. Real transports always
-    // report elapsedMs; the wall clock is only a defensive fallback.
-    totalElapsedMs: reportedDurationMs || Math.max(0, Date.now() - startedAtMs),
-  };
 }
 
 async function verifyJobEnvironment(job, { force = false } = {}) {
@@ -428,71 +666,45 @@ async function verifyJobEnvironment(job, { force = false } = {}) {
   return job.environmentCheckPromise;
 }
 
-async function processPool(job, pool, waitForStart) {
-  if (pool.isActive === false && !job.includeInactive) {
-    job.skipped += 1;
-    job.completed += 1;
-    return;
-  }
-
-  const controller = new AbortController();
-  job.controllers.add(controller);
-  const testedAt = new Date().toISOString();
-  const startedAtMs = Date.now();
-  let result;
-  let attemptDurationMs = 0;
-  let internalFailure = false;
-  ensureJobTelemetry(job);
-  job.inFlight += 1;
-
-  try {
-    const checked = await testPoolWithRetry(pool, controller.signal, waitForStart);
-    result = checked.result;
-    attemptDurationMs = checked.totalElapsedMs;
-    job.retried += Math.max(0, checked.attempts - 1);
-  } catch (error) {
-    internalFailure = true;
-    result = {
-      ok: false,
-      elapsedMs: 0,
-      error: sanitizeError(error?.message, "Internal health-check error"),
-    };
-  } finally {
-    job.controllers.delete(controller);
-    job.inFlight = Math.max(0, job.inFlight - 1);
-  }
-
+async function finalizePoolResult(
+  job,
+  pool,
+  attempt,
+  { priorInconclusive = false, totalAttemptDurationMs = attempt.durationMs } = {}
+) {
+  const { result, internalFailure, testedAt } = attempt;
   if (job.cancelRequested || result?.cancelled) {
     job.cancelled += 1;
     job.completed += 1;
     return;
   }
 
-  const probeLatencyMs = Math.max(0, Number(result?.elapsedMs) || (Date.now() - startedAtMs));
-  attemptDurationMs = Math.max(attemptDurationMs, probeLatencyMs);
+  const probeLatencyMs = Math.max(0, Number(result?.elapsedMs) || attempt.durationMs);
   const succeeded = result?.ok === true;
   const inconclusive = !succeeded && (
-    internalFailure
-    || result?.inconclusive === true
-    || result?.proxyFailure === false
-    || typeof result?.ok !== "boolean"
+    priorInconclusive || isInconclusiveAttempt(result, internalFailure)
   );
   const lastError = succeeded
     ? null
     : sanitizeError(result?.error, `Proxy test failed with status ${result?.status || "unknown"}`);
-  const latencyMs = succeeded ? probeLatencyMs : attemptDurationMs;
-  job.attemptDurationTotalMs += attemptDurationMs;
-  if (result?.status === 504 || /timed out/i.test(lastError || "")) {
-    job.timedOut += 1;
-  }
+  const latencyMs = succeeded ? probeLatencyMs : Math.max(probeLatencyMs, totalAttemptDurationMs);
 
   if (inconclusive) {
     job.internalErrors += 1;
   } else if (succeeded) {
+    const aggregateLatencyMs = Math.max(
+      0,
+      Math.min(TEST_TIMEOUT_MS, Math.round(latencyMs)),
+    );
     job.successful += 1;
-    job.latencyTotalMs += latencyMs;
-    job.minLatencyMs = job.minLatencyMs === null ? latencyMs : Math.min(job.minLatencyMs, latencyMs);
-    job.maxLatencyMs = job.maxLatencyMs === null ? latencyMs : Math.max(job.maxLatencyMs, latencyMs);
+    job.latencyTotalMs += aggregateLatencyMs;
+    recordSuccessfulLatency(job, aggregateLatencyMs);
+    job.minLatencyMs = job.minLatencyMs === null
+      ? aggregateLatencyMs
+      : Math.min(job.minLatencyMs, aggregateLatencyMs);
+    job.maxLatencyMs = job.maxLatencyMs === null
+      ? aggregateLatencyMs
+      : Math.max(job.maxLatencyMs, aggregateLatencyMs);
   } else {
     job.failed += 1;
     job.failedById.set(pool.id, {
@@ -501,9 +713,6 @@ async function processPool(job, pool, waitForStart) {
     });
   }
   job.completed += 1;
-  const completedAtMs = Date.now();
-  job.recentCompletionTimes.push(completedAtMs);
-  pruneRecentCompletions(job, completedAtMs);
 
   // An infrastructure/checker failure is not evidence that the proxy changed
   // health. Preserve its last conclusive state and keep it out of disable lists.
@@ -530,6 +739,106 @@ async function processPool(job, pool, waitForStart) {
   }
 
   await queueHealthWrite(job, healthUpdate);
+}
+
+async function processInitialPool(
+  job,
+  pool,
+  waitForStart,
+  acquireProbeSlot,
+  retryCandidates,
+  onInitialStart,
+  onRetryQueued
+) {
+  if (pool.isActive === false && !job.includeInactive) {
+    job.skipped += 1;
+    job.completed += 1;
+    job.initialCompleted += 1;
+    recordInitialCompletion(job);
+    return;
+  }
+
+  const attempt = await runPoolAttempt(
+    job,
+    pool,
+    waitForStart,
+    acquireProbeSlot,
+    { onStart: onInitialStart }
+  );
+  job.initialCompleted += 1;
+  recordInitialCompletion(job);
+
+  if (job.cancelRequested || attempt.result?.cancelled) {
+    await finalizePoolResult(job, pool, attempt);
+    return;
+  }
+
+  if (
+    !attempt.internalFailure
+    && attempt.result?.ok === false
+    && attempt.result?.retryable === true
+  ) {
+    retryCandidates.push({
+      pool,
+      firstDurationMs: attempt.durationMs,
+      firstInconclusive: isInconclusiveAttempt(attempt.result),
+      claimed: false,
+      finalized: false,
+    });
+    job.retryTotal += 1;
+    onRetryQueued();
+
+    // A burst of first-pass conclusive failures may indicate that this server,
+    // its network, or the probe targets are unhealthy. Recheck the environment,
+    // but never persist or classify the provisional proxy result here.
+    if (!isInconclusiveAttempt(attempt.result)) {
+      job.failuresSinceEnvironmentCheck += 1;
+      await verifyJobEnvironment(job);
+    }
+    return;
+  }
+
+  await finalizePoolResult(job, pool, attempt);
+}
+
+async function processRetryCandidate(job, candidate, waitForStart, acquireProbeSlot) {
+  if (candidate.finalized) return;
+  if (job.cancelRequested) {
+    candidate.finalized = true;
+    job.retryCancelled += 1;
+    job.cancelled += 1;
+    job.completed += 1;
+    return;
+  }
+
+  const attempt = await runPoolAttempt(
+    job,
+    candidate.pool,
+    waitForStart,
+    acquireProbeSlot,
+    { testUrl: RETRY_TEST_URL }
+  );
+  if (attempt.attemptStarted) {
+    job.retried += 1;
+    job.retryCompleted += 1;
+  } else if (attempt.result?.cancelled) {
+    job.retryCancelled += 1;
+  }
+  candidate.finalized = true;
+  await finalizePoolResult(job, candidate.pool, attempt, {
+    priorInconclusive: candidate.firstInconclusive,
+    totalAttemptDurationMs: candidate.firstDurationMs + attempt.durationMs,
+  });
+}
+
+function cancelUnfinishedRetryCandidates(job, retryCandidates) {
+  for (const candidate of retryCandidates) {
+    if (candidate.finalized) continue;
+    candidate.finalized = true;
+    job.retryCancelled += 1;
+    job.cancelled += 1;
+    job.completed += 1;
+  }
 }
 
 function stableHash(value) {
@@ -565,24 +874,207 @@ function createStartRateLimiter(maxStartsPerSecond) {
   let nextStartAt = Date.now();
   let chain = Promise.resolve();
 
-  return () => {
+  const waitUntilScheduled = (waitMs, signal) => {
+    if (waitMs <= 0) return Promise.resolve(!signal?.aborted);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve(true);
+      }, waitMs);
+      const onAbort = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(false);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  };
+
+  return (signal) => {
     chain = chain.then(async () => {
+      if (signal?.aborted) return false;
       const now = Date.now();
       const scheduledAt = Math.max(now, nextStartAt);
       nextStartAt = scheduledAt + spacingMs;
       const waitMs = scheduledAt - now;
-      if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+      const reachedStart = await waitUntilScheduled(waitMs, signal);
+      return reachedStart && !signal?.aborted;
     });
     return chain;
   };
 }
 
+function createProbeConcurrencyLimiter(limit) {
+  let active = 0;
+  const waiters = [];
+
+  const makeRelease = () => {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      active = Math.max(0, active - 1);
+
+      while (waiters.length > 0) {
+        const waiter = waiters.shift();
+        waiter.signal?.removeEventListener("abort", waiter.onAbort);
+        if (waiter.signal?.aborted) {
+          waiter.resolve(null);
+          continue;
+        }
+        active += 1;
+        waiter.resolve(makeRelease());
+        break;
+      }
+    };
+  };
+
+  return (signal) => {
+    if (signal?.aborted) return Promise.resolve(null);
+    if (active < limit) {
+      active += 1;
+      return Promise.resolve(makeRelease());
+    }
+
+    return new Promise((resolve) => {
+      const waiter = {
+        signal,
+        resolve,
+        onAbort: null,
+      };
+      waiter.onAbort = () => {
+        const index = waiters.indexOf(waiter);
+        if (index >= 0) waiters.splice(index, 1);
+        signal?.removeEventListener("abort", waiter.onAbort);
+        resolve(null);
+      };
+      signal?.addEventListener("abort", waiter.onAbort, { once: true });
+      waiters.push(waiter);
+    });
+  };
+}
+
+function createAsyncSignal() {
+  const waiters = new Set();
+
+  return {
+    wait() {
+      return new Promise((resolve) => {
+        waiters.add(resolve);
+      });
+    },
+    notify() {
+      const pending = [...waiters];
+      waiters.clear();
+      for (const resolve of pending) resolve();
+    },
+  };
+}
+
+async function settleWorkers(job, workerCount, worker) {
+  const guardedWorker = async () => {
+    try {
+      await worker();
+    } catch (error) {
+      // Stop new work immediately, but do not let the job become terminal
+      // until every sibling has observed cancellation and settled.
+      job.cancelRequested = true;
+      for (const controller of job.controllers) controller.abort();
+      throw error;
+    }
+  };
+  const outcomes = await Promise.allSettled(
+    Array.from({ length: workerCount }, () => guardedWorker())
+  );
+  const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+  if (rejected) throw rejected.reason;
+}
+
+async function runWorkerPhase(job, items, handler) {
+  let nextIndex = 0;
+  const worker = async () => {
+    while (!job.cancelRequested) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      await handler(items[index]);
+    }
+  };
+  const workerCount = Math.min(job.concurrency, items.length);
+  await settleWorkers(job, workerCount, worker);
+}
+
+async function runOpportunisticRetryLoop({
+  job,
+  retryCandidates,
+  waitForStart,
+  acquireProbeSlot,
+  allInitialStartedPromise,
+  initialPhaseDonePromise,
+  retrySignal,
+}) {
+  // A retry may overlap a still-running primary only after every eligible
+  // unique record has reached the real network probe. Before that point a
+  // retry would consume either a socket or a rate-limiter start that belongs
+  // to an untouched record.
+  const everyInitialStarted = await Promise.race([
+    allInitialStartedPromise.then(() => true),
+    initialPhaseDonePromise.then(() => false),
+  ]);
+  if (!everyInitialStarted || job.cancelRequested) return;
+
+  let nextRetryIndex = 0;
+  const worker = async () => {
+    while (!job.cancelRequested) {
+      if (nextRetryIndex < retryCandidates.length) {
+        const candidate = retryCandidates[nextRetryIndex];
+        nextRetryIndex += 1;
+        candidate.claimed = true;
+        await processRetryCandidate(
+          job,
+          candidate,
+          waitForStart,
+          acquireProbeSlot
+        );
+        continue;
+      }
+
+      // Once all primary workers have settled, no later candidate can appear.
+      if (job.initialPhaseDone) return;
+      await retrySignal.wait();
+    }
+  };
+
+  await settleWorkers(job, job.concurrency, worker);
+}
+
 async function runHealthJob(job, pools) {
   job.status = "running";
+  job.phase = "initial";
   job.startedAtMs = Date.now();
+  job.rateWindowStartedAtMs = job.startedAtMs;
   const scheduledPools = scheduleHealthPools(pools);
   const waitForStart = createStartRateLimiter(job.maxStartsPerSecond || MAX_STARTS_PER_SECOND);
-  let nextIndex = 0;
+  const acquireProbeSlot = createProbeConcurrencyLimiter(job.concurrency);
+  const retryCandidates = [];
+  const retrySignal = createAsyncSignal();
+  const eligiblePrimaryCount = scheduledPools.reduce(
+    (count, pool) => count + (pool.isActive !== false || job.includeInactive ? 1 : 0),
+    0
+  );
+  let resolveAllInitialStarted;
+  const allInitialStartedPromise = new Promise((resolve) => {
+    resolveAllInitialStarted = resolve;
+  });
+  if (eligiblePrimaryCount === 0) resolveAllInitialStarted();
+  const onInitialStart = () => {
+    job.initialStarted += 1;
+    if (job.initialStarted === eligiblePrimaryCount) resolveAllInitialStarted();
+  };
+  let resolveInitialPhaseDone;
+  const initialPhaseDonePromise = new Promise((resolve) => {
+    resolveInitialPhaseDone = resolve;
+  });
   const persistenceTimer = setInterval(() => {
     if (job.pendingWrites.length > 0) void flushHealthWrites(job);
   }, HEALTH_WRITE_FLUSH_INTERVAL_MS);
@@ -591,18 +1083,69 @@ async function runHealthJob(job, pools) {
   // Multiple server-side workers overlap network I/O. CPU worker threads add
   // transfer overhead here and cannot make SQLite's single writer parallel,
   // so health persistence stays safely serialized in transaction chunks.
-  const worker = async () => {
-    while (!job.cancelRequested) {
-      const index = nextIndex;
-      nextIndex += 1;
-      if (index >= scheduledPools.length) return;
-      await processPool(job, scheduledPools[index], waitForStart);
-    }
-  };
-
   try {
-    const workerCount = Math.min(job.concurrency, pools.length);
-    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    // Unique records always get first priority. Once the final eligible
+    // primary has actually started, retries may use newly freed capacity while
+    // the last slow primaries are still running. Both lanes share the same
+    // socket semaphore and 25-starts/second limiter.
+    const initialPhasePromise = runWorkerPhase(
+      job,
+      scheduledPools,
+      (pool) => processInitialPool(
+        job,
+        pool,
+        waitForStart,
+        acquireProbeSlot,
+        retryCandidates,
+        onInitialStart,
+        retrySignal.notify
+      )
+    );
+    initialPhasePromise.then(
+      () => {
+        job.initialPhaseDone = true;
+        retrySignal.notify();
+        resolveInitialPhaseDone();
+      },
+      () => {
+        job.initialPhaseDone = true;
+        retrySignal.notify();
+        resolveInitialPhaseDone();
+      }
+    );
+
+    const retryLoopOutcomePromise = runOpportunisticRetryLoop({
+      job,
+      retryCandidates,
+      waitForStart,
+      acquireProbeSlot,
+      allInitialStartedPromise,
+      initialPhaseDonePromise,
+      retrySignal,
+    }).then(
+      () => ({ error: null }),
+      (error) => ({ error })
+    );
+    const initialOutcome = await initialPhasePromise.then(
+      () => ({ error: null }),
+      (error) => ({ error })
+    );
+
+    if (initialOutcome.error) {
+      job.cancelRequested = true;
+      for (const controller of job.controllers) controller.abort();
+      retrySignal.notify();
+    } else if (!job.cancelRequested && retryCandidates.some((candidate) => !candidate.finalized)) {
+      job.phase = "retrying";
+      resetRateWindow(job);
+    }
+
+    const retryLoopOutcome = await retryLoopOutcomePromise;
+    if (job.cancelRequested) cancelUnfinishedRetryCandidates(job, retryCandidates);
+    if (initialOutcome.error) throw initialOutcome.error;
+    if (retryLoopOutcome.error) throw retryLoopOutcome.error;
+
+    job.phase = "finalizing";
     await flushHealthWrites(job);
 
     if (!job.cancelRequested && job.persistenceErrors === 0 && job.failed > 0) {
@@ -633,15 +1176,28 @@ async function runHealthJob(job, pools) {
     } else {
       job.status = "completed";
     }
+    retryCandidates.length = 0;
     console.log(
       `[Proxy Health Check] Job ${job.id} ${job.status}: ${job.successful} healthy, ${job.failed} failed, ${job.internalErrors} inconclusive, ${job.skipped} skipped`
     );
   } catch (error) {
+    clearInterval(persistenceTimer);
     job.status = "failed";
     job.error = "Health check job failed on the server";
+    job.pendingWrites.length = 0;
+    job.pendingFailureWrites.length = 0;
+    job.failedById.clear();
+    for (const controller of job.controllers) controller.abort();
+    // A timer-triggered success batch may already own the serialized write
+    // chain. Let it settle before publishing the terminal snapshot so counters
+    // and persistence revisions cannot mutate after completion.
+    await job.writeChain;
     console.error(`[Proxy Health Check] Job ${job.id} failed:`, error);
   } finally {
     clearInterval(persistenceTimer);
+    job.medianLatencyMs = getMedianLatency(job);
+    job.latencyHistogram = null;
+    job.latencyHistogramFinalized = true;
     job.finishedAtMs = Date.now();
     job.controllers.clear();
     if (healthState.activeJobId === job.id) healthState.activeJobId = null;
@@ -671,7 +1227,7 @@ async function disableFailedJobResults(body) {
   if (job.classificationVersion !== HEALTH_CLASSIFICATION_VERSION) {
     return NextResponse.json(
       {
-        error: "This health check used the legacy one-shot classifier. Re-run it before disabling failed proxies.",
+        error: "This health check used an older scheduler. Re-run it before disabling failed proxies.",
       },
       { status: 409 }
     );

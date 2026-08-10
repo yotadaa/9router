@@ -37,24 +37,92 @@ function formatDuration(ms) {
   return `${seconds}s`;
 }
 
+function formatLatency(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return "-";
+  return `${Number.isInteger(ms) ? ms : ms.toFixed(1)}ms`;
+}
+
+function getHealthPhasePresentation(progress) {
+  if (progress.phase === "initial") {
+    return {
+      label: "Initial checks",
+      value: `${progress.initialCompleted.toLocaleString()} / ${progress.total.toLocaleString()}`,
+      detail: "First checks stay prioritized; retries use available capacity only after every initial check has started",
+      etaLabel: "Initial ETA",
+      buttonLabel: `Initial ${progress.initialCompleted}/${progress.total}`,
+    };
+  }
+  if (progress.phase === "retrying") {
+    return {
+      label: "Confirming retries",
+      value: `${progress.retryCompleted.toLocaleString()} / ${progress.retryTotal.toLocaleString()}`,
+      detail: "Rechecking uncertain results against the fallback target",
+      etaLabel: "Retry ETA",
+      buttonLabel: `Retry ${progress.retryCompleted}/${progress.retryTotal}`,
+    };
+  }
+  if (progress.phase === "finalizing") {
+    return {
+      label: "Saving confirmed results",
+      value: "",
+      detail: "Finishing the server-side persistence queue",
+      etaLabel: "ETA",
+      buttonLabel: "Finalizing",
+    };
+  }
+  return {
+    label: "Checking proxies",
+    value: `${progress.current.toLocaleString()} / ${progress.total.toLocaleString()}`,
+    detail: "This job started before phased retry telemetry was available",
+    etaLabel: "ETA",
+    buttonLabel: `Checking ${progress.current}/${progress.total}`,
+  };
+}
+
 function createHealthProgressTracker(targetCount, initialSnapshot = {}) {
-  let previousCompleted = Number(initialSnapshot.completed) || 0;
+  let previousPhase = initialSnapshot.phase || "legacy";
+  let previousPhaseCompleted = previousPhase === "retrying"
+    ? (Number(initialSnapshot.retryCompleted) || 0)
+    : previousPhase === "initial"
+      ? (Number(initialSnapshot.initialCompleted) || 0)
+      : (Number(initialSnapshot.completed) || 0);
   let previousSampleAt = Date.now();
   let measuredRate = Number(initialSnapshot.currentRatePerSecond) || 0;
 
   return (snapshot) => {
     const now = Date.now();
     const completed = Number(snapshot.completed) || 0;
+    const phase = snapshot.phase || "legacy";
+    const initialCompleted = Number(snapshot.initialCompleted) || completed;
+    const retryTotal = Number(snapshot.retryTotal) || Number(snapshot.retried) || 0;
+    const retryCompleted = Number(snapshot.retryCompleted) || Number(snapshot.retried) || 0;
+    const pendingRetries = Number.isFinite(snapshot.pendingRetries)
+      ? Math.max(0, snapshot.pendingRetries)
+      : Math.max(0, retryTotal - retryCompleted);
+    const phaseCompleted = phase === "retrying"
+      ? retryCompleted
+      : phase === "initial"
+        ? initialCompleted
+        : completed;
     const elapsedSeconds = Math.max(0.001, (now - previousSampleAt) / 1_000);
-    const completionDelta = Math.max(0, completed - previousCompleted);
-    if (completionDelta > 0) measuredRate = completionDelta / elapsedSeconds;
-    previousCompleted = completed;
+    if (phase !== previousPhase) {
+      measuredRate = 0;
+    } else {
+      const completionDelta = Math.max(0, phaseCompleted - previousPhaseCompleted);
+      measuredRate = completionDelta / elapsedSeconds;
+    }
+    previousPhase = phase;
+    previousPhaseCompleted = phaseCompleted;
     previousSampleAt = now;
 
     const serverRate = Number(snapshot.currentRatePerSecond) || 0;
     const rate = serverRate > 0 ? serverRate : measuredRate;
     const total = Number(snapshot.total) || targetCount;
-    const remaining = Math.max(0, total - completed);
+    const remaining = phase === "retrying"
+      ? pendingRetries
+      : phase === "initial"
+        ? Math.max(0, total - initialCompleted)
+        : Math.max(0, total - completed);
     const telemetryAvailable = snapshot.telemetryAvailable !== false;
     const estimatedRemainingMs = Number.isFinite(snapshot.estimatedRemainingMs)
       ? snapshot.estimatedRemainingMs
@@ -63,6 +131,12 @@ function createHealthProgressTracker(targetCount, initialSnapshot = {}) {
     return {
       current: completed,
       total,
+      phase,
+      initialCompleted,
+      retryTotal,
+      retryCompleted,
+      pendingRetries,
+      attemptCount: Number(snapshot.attemptCount) || 0,
       valid: Number(snapshot.successful) || 0,
       errors: Number(snapshot.failed) || 0,
       inconclusive: Number(snapshot.internalErrors) || 0,
@@ -73,6 +147,9 @@ function createHealthProgressTracker(targetCount, initialSnapshot = {}) {
       inFlight: telemetryAvailable ? (Number(snapshot.inFlight) || 0) : null,
       rate,
       averageAttemptMs: telemetryAvailable ? (snapshot.stats?.averageAttemptMs ?? null) : null,
+      minLatencyMs: telemetryAvailable ? (snapshot.stats?.minLatencyMs ?? null) : null,
+      medianLatencyMs: telemetryAvailable ? (snapshot.stats?.medianLatencyMs ?? null) : null,
+      maxLatencyMs: telemetryAvailable ? (snapshot.stats?.maxLatencyMs ?? null) : null,
       telemetryAvailable,
       classificationReliable: snapshot.classificationReliable !== false,
       estimatedRemainingMs,
@@ -115,6 +192,12 @@ export default function ProxyPoolsPage() {
   const [healthProgress, setHealthProgress] = useState({
     current: 0,
     total: 0,
+    phase: "initial",
+    initialCompleted: 0,
+    retryTotal: 0,
+    retryCompleted: 0,
+    pendingRetries: 0,
+    attemptCount: 0,
     valid: 0,
     errors: 0,
     inconclusive: 0,
@@ -125,6 +208,9 @@ export default function ProxyPoolsPage() {
     inFlight: 0,
     rate: 0,
     averageAttemptMs: null,
+    minLatencyMs: null,
+    medianLatencyMs: null,
+    maxLatencyMs: null,
     telemetryAvailable: true,
     classificationReliable: true,
     estimatedRemainingMs: null,
@@ -264,7 +350,7 @@ export default function ProxyPoolsPage() {
       await applySnapshot(data);
     }
 
-    setLatencyStats(data.stats ? {
+    setLatencyStats(data.status === "completed" && data.stats ? {
       ...data.stats,
       durationMs: data.durationMs || 0,
       scope: data.scope,
@@ -273,7 +359,12 @@ export default function ProxyPoolsPage() {
     await fetchProxyPools();
 
     if (data.status === "cancelled") {
-      notify.warning("Health check cancelled after " + (data.completed || 0) + " proxy pools.");
+      notify.warning(
+        "Health check cancelled: "
+        + (data.initialCompleted || 0) + "/" + (data.total || 0) + " initial checks and "
+        + (data.retryCompleted || 0) + "/" + (data.retryTotal || 0) + " retries completed. "
+        + "Saved results were kept."
+      );
       return;
     }
     if (data.status !== "completed") {
@@ -282,7 +373,8 @@ export default function ProxyPoolsPage() {
 
     const statMsg = data.stats?.averageLatencyMs !== null
       ? "\nAverage latency: " + data.stats.averageLatencyMs + "ms (min "
-        + data.stats.minLatencyMs + "ms, max " + data.stats.maxLatencyMs + "ms)"
+        + data.stats.minLatencyMs + "ms, median " + formatLatency(data.stats.medianLatencyMs)
+        + ", max " + data.stats.maxLatencyMs + "ms)"
       : "";
     const durationMsg = "\nDuration: " + ((data.durationMs || 0) / 1000).toFixed(1) + "s";
 
@@ -624,6 +716,12 @@ export default function ProxyPoolsPage() {
     setHealthProgress({
       current: 0,
       total: targetCount,
+      phase: "initial",
+      initialCompleted: 0,
+      retryTotal: 0,
+      retryCompleted: 0,
+      pendingRetries: 0,
+      attemptCount: 0,
       valid: 0,
       errors: 0,
       inconclusive: 0,
@@ -634,6 +732,9 @@ export default function ProxyPoolsPage() {
       inFlight: 0,
       rate: 0,
       averageAttemptMs: null,
+      minLatencyMs: null,
+      medianLatencyMs: null,
+      maxLatencyMs: null,
       telemetryAvailable: true,
       classificationReliable: true,
       estimatedRemainingMs: null,
@@ -904,6 +1005,8 @@ export default function ProxyPoolsPage() {
     );
   }
 
+  const healthPhasePresentation = getHealthPhasePresentation(healthProgress);
+
   return (
     <div className="mx-auto flex w-full max-w-5xl flex-col gap-4 px-1 sm:gap-6 sm:px-0">
       {/* Concurrent Health Check Settings - Collapsible Panel */}
@@ -1016,6 +1119,8 @@ export default function ProxyPoolsPage() {
                 <li><strong>Balanced:</strong> Faster checks with moderate resource usage</li>
                 <li><strong>Aggressive:</strong> High concurrency for selected checks</li>
                 <li><strong>Maximum:</strong> 64 async checks, protected by the 25-starts/second limit</li>
+                <li>Concurrency overlaps waiting connections; slow responses and 10-second timeouts determine checks/second</li>
+                <li>Complete checks start with previously slow records to avoid a long timeout tail</li>
                 <li>The browser only polls compact progress counters</li>
               </ul>
             </div>
@@ -1096,7 +1201,7 @@ export default function ProxyPoolsPage() {
             title={`Checks every record with ${MAX_HEALTH_CONCURRENCY} parallel server workers`}
           >
             {healthChecking
-              ? `Checking ${healthProgress.current}/${healthProgress.total}`
+              ? healthPhasePresentation.buttonLabel
               : "Complete Health Check"}
           </Button>
           <Button size="sm" variant="secondary" icon="upload" onClick={openBatchImportModal}>
@@ -1109,7 +1214,6 @@ export default function ProxyPoolsPage() {
       {healthChecking && (
         <section
           className="rounded-xl border border-primary/25 bg-primary/5 px-4 py-4"
-          aria-live="polite"
           aria-label="Live proxy health check status"
         >
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1124,13 +1228,25 @@ export default function ProxyPoolsPage() {
             </div>
             <div className="flex flex-wrap items-start justify-end gap-3">
               <div className="text-right text-xs text-text-muted">
-                <div className="font-mono font-semibold text-text-main">
-                  {healthProgress.rate.toFixed(1)} checks/s
-                </div>
-                <div>
-                  {healthProgress.inFlight === null ? "-" : healthProgress.inFlight} in flight
-                  {" | "}ETA {formatDuration(healthProgress.estimatedRemainingMs)}
-                </div>
+                {healthProgress.phase === "finalizing" ? (
+                  <>
+                    <div className="font-semibold text-text-main">Saving results</div>
+                    <div>Server-side finalization in progress</div>
+                  </>
+                ) : (
+                  <>
+                    <div
+                      className="font-mono font-semibold text-text-main"
+                      title="Completed network attempts during the recent 15-second window"
+                    >
+                      {healthProgress.rate.toFixed(1)} checks/s
+                    </div>
+                    <div>
+                      {healthProgress.inFlight === null ? "-" : healthProgress.inFlight} in flight
+                      {" | "}{healthPhasePresentation.etaLabel} {formatDuration(healthProgress.estimatedRemainingMs)}
+                    </div>
+                  </>
+                )}
               </div>
               <Button
                 size="sm"
@@ -1144,19 +1260,36 @@ export default function ProxyPoolsPage() {
             </div>
           </div>
 
+          <div className="mt-3 flex flex-wrap items-baseline gap-x-2 gap-y-1 text-xs">
+            <span
+              className="font-semibold text-text-main"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              {healthPhasePresentation.label}
+            </span>
+            {healthPhasePresentation.value && (
+              <span className="font-mono text-text-main">{healthPhasePresentation.value}</span>
+            )}
+            <span className="text-text-muted">{healthPhasePresentation.detail}.</span>
+          </div>
+
           {(!healthProgress.telemetryAvailable || !healthProgress.classificationReliable) && (
             <div className="mt-3 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-              This job started with the legacy one-shot checker. Stop and restart it for
-              confirmed retries and Avg attempt telemetry. Disabling its failed set is blocked.
+              This job started with an older health checker. Stop and restart it for
+              phase-separated retries and complete telemetry. Disabling its failed set is blocked.
             </div>
           )}
 
           <div
             className="mt-3 h-2 overflow-hidden rounded-full bg-black/10 dark:bg-white/10"
             role="progressbar"
+            aria-label="Finalized proxy health-check progress"
             aria-valuemin="0"
             aria-valuemax={healthProgress.total}
             aria-valuenow={healthProgress.current}
+            aria-valuetext={`${healthProgress.current.toLocaleString()} of ${healthProgress.total.toLocaleString()} finalized; ${healthProgress.initialCompleted.toLocaleString()} initially checked; ${healthProgress.pendingRetries.toLocaleString()} retry confirmations pending`}
           >
             <div
               className="h-full rounded-full bg-primary"
@@ -1168,9 +1301,9 @@ export default function ProxyPoolsPage() {
             />
           </div>
 
-          <dl className="mt-4 flex flex-wrap gap-x-6 gap-y-3">
+          <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 sm:grid-cols-4 lg:grid-cols-6">
             <div>
-              <dt className="text-xs text-text-muted">Checked</dt>
+              <dt className="text-xs text-text-muted">Finalized</dt>
               <dd className="font-mono text-sm font-semibold text-text-main">
                 {healthProgress.current.toLocaleString()} / {healthProgress.total.toLocaleString()}
               </dd>
@@ -1193,8 +1326,8 @@ export default function ProxyPoolsPage() {
                 {healthProgress.inconclusive.toLocaleString()}
               </dd>
             </div>
-            <div>
-              <dt className="text-xs text-text-muted">Timeouts</dt>
+            <div title="Timed-out network attempts, including retry attempts">
+              <dt className="text-xs text-text-muted">Timeout attempts</dt>
               <dd className="font-mono text-sm font-semibold text-amber-500">
                 {healthProgress.timedOut === null ? "-" : healthProgress.timedOut.toLocaleString()}
               </dd>
@@ -1215,9 +1348,31 @@ export default function ProxyPoolsPage() {
               </dd>
             </div>
             <div>
-              <dt className="text-xs text-text-muted">Retried</dt>
+              <dt className="text-xs text-text-muted">Retries</dt>
               <dd className="font-mono text-sm font-semibold text-text-main">
-                {healthProgress.retried.toLocaleString()}
+                {healthProgress.phase === "initial"
+                  ? `${healthProgress.retryCompleted.toLocaleString()} done · ${healthProgress.pendingRetries.toLocaleString()} pending`
+                  : healthProgress.phase === "retrying"
+                    ? `${healthProgress.retryCompleted.toLocaleString()} / ${healthProgress.retryTotal.toLocaleString()}`
+                    : `${healthProgress.retryCompleted.toLocaleString()} done`}
+              </dd>
+            </div>
+            <div title="Successful proxy checks only">
+              <dt className="text-xs text-text-muted">Min latency</dt>
+              <dd className="font-mono text-sm font-semibold text-text-main">
+                {formatLatency(healthProgress.minLatencyMs)}
+              </dd>
+            </div>
+            <div title="Successful proxy checks only">
+              <dt className="text-xs text-text-muted">Median latency</dt>
+              <dd className="font-mono text-sm font-semibold text-text-main">
+                {formatLatency(healthProgress.medianLatencyMs)}
+              </dd>
+            </div>
+            <div title="Successful proxy checks only">
+              <dt className="text-xs text-text-muted">Max latency</dt>
+              <dd className="font-mono text-sm font-semibold text-text-main">
+                {formatLatency(healthProgress.maxLatencyMs)}
               </dd>
             </div>
           </dl>
@@ -1282,7 +1437,7 @@ export default function ProxyPoolsPage() {
                   disabled={healthChecking || bulkBusy}
                 >
                   {healthChecking
-                    ? `Checking ${healthProgress.current}/${healthProgress.total}`
+                    ? healthPhasePresentation.buttonLabel
                     : "Check Selected"}
                 </Button>
               )}
@@ -1353,11 +1508,11 @@ export default function ProxyPoolsPage() {
               </div>
 
               <div>
-                <p className="text-xs text-text-muted">Latency range</p>
+                <p className="text-xs text-text-muted">Min / median / max</p>
                 <p className="text-base font-semibold text-text-main">
                   {latencyStats.minLatencyMs === null
                     ? "-"
-                    : `${latencyStats.minLatencyMs}-${latencyStats.maxLatencyMs}ms`}
+                    : `${formatLatency(latencyStats.minLatencyMs)} / ${formatLatency(latencyStats.medianLatencyMs)} / ${formatLatency(latencyStats.maxLatencyMs)}`}
                 </p>
               </div>
 

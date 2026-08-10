@@ -195,7 +195,7 @@ describe("complete health-check validity safeguards", () => {
       internalErrors: 0,
       persisted: 1,
       retried: 1,
-      stats: { averageAttemptMs: 10024, retried: 1 },
+      stats: { averageAttemptMs: 5012, retried: 1 },
     });
     expect(persistedUpdates()).toEqual([
       expect.objectContaining({
@@ -205,6 +205,124 @@ describe("complete health-check validity safeguards", () => {
         latencyMs: 24,
       }),
     ]);
+  });
+
+  it("starts every unique first attempt before overlapping lower-priority retries", async () => {
+    const pools = Array.from({ length: 3 }, (_, index) => ({
+      ...pool,
+      id: `two-phase-${index}`,
+      name: `Two phase ${index}`,
+      proxyUrl: `http://user:secret@two-phase-${index}.test:8080`,
+    }));
+    dbMocks.getProxyPools.mockResolvedValue(pools);
+
+    let primaryStarted = 0;
+    let releaseLastPrimary;
+    const lastPrimaryGate = new Promise((resolve) => { releaseLastPrimary = resolve; });
+    let retryStarted = 0;
+    let releaseRetries;
+    const retryGate = new Promise((resolve) => { releaseRetries = resolve; });
+    const callOrder = [];
+    networkMocks.testProxyUrl.mockImplementation(async ({ proxyUrl, testUrl }) => {
+      const isRetry = Boolean(testUrl);
+      callOrder.push({ proxyUrl, isRetry });
+      if (isRetry) {
+        retryStarted += 1;
+        await retryGate;
+        return {
+          ok: true,
+          targetOk: true,
+          status: 204,
+          elapsedMs: 20,
+          error: null,
+        };
+      }
+
+      primaryStarted += 1;
+      if (primaryStarted === pools.length) await lastPrimaryGate;
+      return {
+        ok: false,
+        status: 504,
+        elapsedMs: 10,
+        error: "Proxy test timed out",
+        failureKind: "timeout",
+        retryable: true,
+        proxyFailure: true,
+        inconclusive: false,
+      };
+    });
+    const { GET, POST } = await loadRoute();
+
+    const start = await (await POST(makePost({ scope: "all", concurrency: 3 }))).json();
+    await waitUntil(() => primaryStarted === pools.length);
+    await waitUntil(() => retryStarted === 2);
+    const live = await waitForSnapshot(
+      GET,
+      start.jobId,
+      (snapshot) => (
+        snapshot.phase === "initial"
+        && snapshot.initialStarted === 3
+        && snapshot.initialCompleted === 2
+        && snapshot.inFlight === 3
+      )
+    );
+
+    expect(live).toMatchObject({
+      status: "running",
+      phase: "initial",
+      total: 3,
+      completed: 0,
+      initialStarted: 3,
+      initialCompleted: 2,
+      retryTotal: 2,
+      retryCompleted: 0,
+      pendingRetries: 2,
+      attemptCount: 2,
+      successful: 0,
+      failed: 0,
+      internalErrors: 0,
+      inFlight: 3,
+    });
+    expect(live.pendingRetries).toEqual(expect.any(Number));
+    expect(live).not.toHaveProperty("retryIds");
+    expect(live).not.toHaveProperty("retryQueue");
+    expect(live).not.toHaveProperty("retryCandidates");
+    expect(live).not.toHaveProperty("results");
+    expect(JSON.stringify(live)).not.toContain("two-phase-");
+    expect(dbMocks.bulkUpdateProxyPoolHealth).not.toHaveBeenCalled();
+    expect(callOrder.slice(0, 3).every(({ isRetry }) => !isRetry)).toBe(true);
+    expect(callOrder.slice(3).every(({ isRetry }) => isRetry)).toBe(true);
+
+    releaseLastPrimary();
+    // The third candidate joins the live retry queue immediately. It must not
+    // wait for the first two deliberately blocked retries to finish.
+    await waitUntil(() => retryStarted === 3);
+    releaseRetries();
+    const terminal = await waitForTerminal(GET, start.jobId);
+
+    expect(callOrder.map(({ isRetry }) => isRetry)).toEqual([
+      false, false, false, true, true, true,
+    ]);
+    expect(terminal).toMatchObject({
+      status: "completed",
+      phase: "finalizing",
+      total: 3,
+      completed: 3,
+      initialCompleted: 3,
+      retryTotal: 3,
+      retryCompleted: 3,
+      retryCancelled: 0,
+      pendingRetries: 0,
+      attemptCount: 6,
+      successful: 3,
+      failed: 0,
+      internalErrors: 0,
+      retried: 3,
+      persisted: 3,
+      stats: { averageAttemptMs: 15 },
+    });
+    expect(persistedUpdates()).toHaveLength(3);
+    expect(persistedUpdates().every((update) => update.testStatus === "active")).toBe(true);
   });
 
   it("marks one conclusive error only after its retryable timeout is exhausted", async () => {
@@ -379,7 +497,7 @@ describe("complete health-check validity safeguards", () => {
     const body = await response.json();
 
     expect(response.status).toBe(409);
-    expect(body.error).toMatch(/legacy one-shot classifier/i);
+    expect(body.error).toMatch(/older scheduler/i);
     expect(dbMocks.disableProxyPoolsFromHealthJob).not.toHaveBeenCalled();
   });
 
@@ -431,6 +549,9 @@ describe("complete health-check validity safeguards", () => {
       failed: 0,
       cancelled: 1,
       persisted: 0,
+      retryTotal: 1,
+      retryCompleted: 1,
+      pendingRetries: 0,
     });
     expect(dbMocks.bulkUpdateProxyPoolHealth).not.toHaveBeenCalled();
   });
