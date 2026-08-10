@@ -450,18 +450,37 @@ export async function getQoderUsage(apiKey, providerSpecificData, proxyOptions =
       let quotaData;
       try {
         quotaData = await simpleResponse.json();
-        console.log("[Qoder Usage] Simple quota response:", JSON.stringify(quotaData));
-        console.log("[Qoder Usage] Success with simple quota API!");
-        return parseQoderQuotaUsage(quotaData);
+        console.log("[Qoder Usage] Direct PAT success with simple quota API, storing for later");
+
+        // Store user credits but continue to fetch activity quotas too
+        if (quotaData.userQuota) {
+          const userQuota = quotaData.userQuota;
+          const limit = Number(userQuota.total) || 0;
+          const used = Number(userQuota.used) || 0;
+          const remaining = Number(userQuota.remaining) || 0;
+
+          if (limit > 0) {
+            combinedQuotas["Credits"] = {
+              name: "Credits",
+              used: used,
+              total: limit,
+              remaining: remaining,
+              remainingPercentage: (remaining / limit) * 100,
+              resetAt: parseResetTime(userQuota.expiresAt),
+              unlimited: false,
+              unit: userQuota.unit || "credits",
+            };
+          }
+        }
       } catch (e) {
-        console.warn("[Qoder Usage] Failed to parse simple quota response:", e.message);
+        console.warn("[Qoder Usage] Failed to parse direct PAT simple quota response:", e.message);
       }
     }
   } catch (error) {
     console.warn("[Qoder Usage] Simple quota API attempt failed:", error.message);
   }
 
-  // Exchange PAT for job token
+  // Exchange PAT for job token (needed for COSY-signed activity API)
   let authToken;
   try {
     console.log("[Qoder Usage] Exchanging PAT for job token...");
@@ -474,14 +493,11 @@ export async function getQoderUsage(apiKey, providerSpecificData, proxyOptions =
     };
   }
 
-  // Fetch BOTH quota sources and combine them
-  const combinedQuotas = {};
-
-  // Source 1: Simple quota API (userQuota from /api/v2/quota/usage)
+  // Fetch Activity API for MODEL_FREE_QUOTA activities (800 free calls example)
   try {
-    console.log("[Qoder Usage] Fetching from simple quota API (/api/v2/quota/usage)...");
-    const simpleResponse = await proxyAwareFetch(
-      QODER_QUOTA_USAGE_URL,
+    console.log("[Qoder Usage] Fetching from activity API (/algo/api/v2/activity)...");
+    const activityResponse = await proxyAwareFetch(
+      QODER_ACTIVITY_URL,
       {
         method: "GET",
         headers: {
@@ -491,33 +507,61 @@ export async function getQoderUsage(apiKey, providerSpecificData, proxyOptions =
       },
       proxyOptions,
     );
-    console.log("[Qoder Usage] Simple quota API status:", simpleResponse.status);
+    console.log("[Qoder Usage] Activity API status:", activityResponse.status);
 
-    if (simpleResponse.ok && simpleResponse.status !== 401 && simpleResponse.status !== 403) {
-      let quotaData;
+    if (activityResponse.ok && activityResponse.status !== 401 && activityResponse.status !== 403) {
+      let activityData;
       try {
-        quotaData = await simpleResponse.json();
+        activityData = await activityResponse.json();
 
-        // Parse userQuota
-        if (quotaData.userQuota) {
-          console.log("[Qoder Usage] Adding userQuota from simple API");
-          combinedQuotas["Credits"] = {
-            name: "Credits",
-            used: Number(quotaData.userQuota.used) || 0,
-            total: Number(quotaData.userQuota.total) || 0,
-            remaining: Number(quotaData.userQuota.remaining) || 0,
-            remainingPercentage: (Number(quotaData.userQuota.total) > 0) ? (Number(quotaData.userQuota.remaining) / Number(quotaData.userQuota.total)) * 100 : 0,
-            resetAt: parseResetTime(quotaData.userQuota.expiresAt),
-            unlimited: false,
-            unit: quotaData.userQuota.unit || "credits",
-          };
+        // Handle nested .data.activities structure
+        let activities = [];
+        if (activityData.data && Array.isArray(activityData.data.activities)) {
+          activities = activityData.data.activities;
+          console.log("[Qoder Usage] Found activities in .data.activities:", activities.length);
+        } else if (Array.isArray(activityData.activities)) {
+          activities = activityData.activities;
+          console.log("[Qoder Usage] Found root-level activities:", activities.length);
+        }
+
+        if (activities.length > 0) {
+          // Find all MODEL_FREE_QUOTA activities
+          for (const activity of activities) {
+            if (activity.type === "MODEL_FREE_QUOTA") {
+              const modelName = activity.modelName || "Free Quota";
+              const limit = Number(activity.limit) || 0;
+              const used = Number(activity.used) || 0;
+              const remaining = Math.max(0, Number(activity.remaining) || 0);
+
+              console.log(`[Qoder Usage] Found FREE QUOTA: ${modelName} - ${remaining}/${limit} remaining`);
+
+              if (limit > 0) {
+                // Only add if not already present (to avoid duplication with Credits)
+                if (!combinedQuotas[modelName]) {
+                  combinedQuotas[modelName] = {
+                    name: modelName,
+                    used: used,
+                    total: limit,
+                    remaining: remaining,
+                    remainingPercentage: (remaining / limit) * 100,
+                    resetAt: parseResetTime(activity.resetAt),
+                    unlimited: false,
+                    statusText: activity.statusText || "",
+                    description: activity.description || "",
+                  };
+                }
+              }
+            }
+          }
         }
       } catch (e) {
-        console.warn("[Qoder Usage] Failed to parse simple quota response:", e.message);
+        console.warn("[Qoder Usage] Failed to parse activity response:", e.message);
       }
+    } else {
+      console.log("[Qoder Usage] Activity API returned", activityResponse.status);
     }
   } catch (error) {
-    console.warn("[Qoder Usage] Simple quota API fetch failed:", error.message);
+    console.warn("[Qoder Usage] Activity API fetch failed:", error.message);
   }
 
   // Source 2: Activity API for MODEL_FREE_QUOTA activities (800 free calls example)
