@@ -715,20 +715,59 @@ export async function getQoderUsage(apiKey, providerSpecificData, proxyOptions =
       );
       if (fallbackResponse.ok) {
         const fallbackData = await fallbackResponse.json();
-        return parseQoderQuotaUsage(fallbackData);
+
+        // Check for activities in fallback response
+        let activities = [];
+        if (fallbackData.data && Array.isArray(fallbackData.data.activities)) {
+          activities = fallbackData.data.activities;
+          console.log("[Qoder Usage] Found activities in fallback .data.activities:", activities.length);
+        } else if (fallbackData.activities && Array.isArray(fallbackData.activities)) {
+          activities = fallbackData.activities;
+          console.log("[Qoder Usage] Found activities in fallback root level:", activities.length);
+        }
+
+        if (activities.length > 0) {
+          for (const activity of activities) {
+            if (activity.type === "MODEL_FREE_QUOTA") {
+              const modelName = activity.modelName || "Free Quota";
+              const limit = Number(activity.limit) || 0;
+              const used = Number(activity.used) || 0;
+              const remaining = Math.max(0, Number(activity.remaining) || 0);
+
+              console.log(`[Qoder Usage] Found FREE QUOTA via fallback: ${modelName} - ${remaining}/${limit} remaining`);
+
+              if (limit > 0) {
+                combinedQuotas[modelName] = {
+                  name: modelName,
+                  used: used,
+                  total: limit,
+                  remaining: remaining,
+                  remainingPercentage: (remaining / limit) * 100,
+                  resetAt: parseResetTime(activity.resetAt),
+                  unlimited: false,
+                  statusText: activity.statusText || "",
+                  description: activity.description || "",
+                };
+              }
+            }
+          }
+        }
       }
     } catch (e) {
       console.warn("[Qoder Usage] Fallback fetch failed:", e.message);
     }
 
-    return {
-      plan: "Qoder Free",
-      message: "No active free quota activities found. You may need to claim available activities.",
-      quotas: {},
-    };
-  }
+    // If we couldn't fetch activity quotas but have user credits, just show credits
+    if (Object.keys(combinedQuotas).length === 0) {
+      console.warn("[Qoder Usage] No quotas fetched at all");
+      return {
+        plan: "Qoder Free",
+        message: "Unable to fetch Qoder quota. Please check your connection.",
+        quotas: {},
+      };
+    }
 
-  // Extract plan label from userType
+    // Extract plan label from userType
   let planLabel = "Qoder Free";
   try {
     const quotaResponse = await proxyAwareFetch(
