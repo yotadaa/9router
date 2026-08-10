@@ -15,6 +15,10 @@ const GLM_QUOTA_URLS = {
 // Returns { balance: "95.50", total_used: "4.50" } (USD as decimal strings).
 const VERCEL_AI_GATEWAY_CREDITS_URL = U("vercel-ai-gateway").url;
 
+// Qoder quota endpoints
+const QODER_QUOTA_USAGE_URL = "https://api3.qoder.sh/api/v2/quota/usage";
+const QODER_ACTIVITY_URL = "https://api3.qoder.sh/algo/api/v2/activity";
+
 /**
  * Qwen Usage
  */
