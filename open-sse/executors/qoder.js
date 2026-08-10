@@ -22,6 +22,10 @@
 
 import { qoderEncodeBody } from "../shared/qoder/encoding.js";
 import { buildCosyHeaders } from "../shared/qoder/cosy.js";
+import {
+  isQoderPat,
+  resolveQoderCredential,
+} from "../shared/qoder/credentials.js";
 import { v4 as uuidv4 } from "uuid";
 import { createHash } from "crypto";
 
@@ -32,11 +36,7 @@ import { SSE_DONE } from "../utils/sseConstants.js";
 import { FETCH_CONNECT_TIMEOUT_MS } from "../config/runtimeConfig.js";
 import {
   QODER_CHAT_URL_ENCODED,
-  QODER_JOB_TOKEN_EXCHANGE_URL,
-  QODER_USERINFO_URL,
   QODER_MODEL_MAP,
-  QODER_IDE_VERSION,
-  QODER_CLIENT_TYPE,
 } from "../shared/qoder/constants.js";
 import { getQoderModelConfig, resolveQoderModels } from "../services/qoderModels.js";
 
@@ -347,86 +347,11 @@ function wrapQoderSSE(response, model) {
 // short-lived job token (jt-...) via /api/v1/jobToken/exchange (plain JSON,
 // not COSY-signed), then resolve the userId from userinfo. Mirrors the
 // official qodercli flow. Cached per-PAT until near-expiry.
-const PAT_PREFIX = "pt-";
-const PAT_REFRESH_BUFFER_MS = 5 * 60 * 1000;
-const patJobCache = new Map();
-
-export function isQoderPat(token) {
-  return typeof token === "string" && token.startsWith(PAT_PREFIX);
-}
-
-async function exchangeJobToken(pat, proxyOptions = null, signal = null) {
-  const res = await proxyAwareFetch(
-    QODER_JOB_TOKEN_EXCHANGE_URL,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
-        "User-Agent": "qodercli/1.0.0",
-        "Cosy-Version": QODER_IDE_VERSION,
-        "Cosy-ClientType": QODER_CLIENT_TYPE,
-      },
-      body: JSON.stringify({ personal_token: pat }),
-      signal,
-    },
-    proxyOptions,
-  );
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(`qoder PAT exchange failed: ${res.status} ${text.slice(0, 200)}`);
-  }
-  const data = await res.json();
-  if (!data.token) throw new Error("qoder PAT exchange returned no job token");
-
-  let expiresAt = Date.now() + 24 * 60 * 60 * 1000;
-  if (data.expires_at) {
-    const parsed = Date.parse(data.expires_at);
-    if (!Number.isNaN(parsed)) expiresAt = parsed;
-  } else if (typeof data.expires_in === "number" && data.expires_in > 0) {
-    expiresAt = Date.now() + data.expires_in;
-  }
-  return { jobToken: data.token, jobRefreshToken: data.refresh_token || "", expiresAt };
-}
-
-async function fetchUserIdForJobToken(jobToken, proxyOptions = null, signal = null) {
-  try {
-    const res = await proxyAwareFetch(
-      QODER_USERINFO_URL,
-      {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${jobToken}`,
-          Accept: "application/json",
-          "User-Agent": "qodercli/1.0.0",
-        },
-        signal,
-      },
-      proxyOptions,
-    );
-    if (!res.ok) return "";
-    const info = await res.json().catch(() => ({}));
-    return info.id || info.userId || info.user_id || "";
-  } catch {
-    return "";
-  }
-}
-
-/**
- * Exchange a PAT for a job token + userId, caching until near-expiry so repeat
- * chat requests don't re-exchange. Returns { accessToken, userId }.
- */
 async function resolvePatCredential(pat, proxyOptions = null, signal = null) {
-  const cached = patJobCache.get(pat);
-  if (cached && cached.expiresAt - Date.now() > PAT_REFRESH_BUFFER_MS) {
-    return cached;
-  }
-  const { jobToken, expiresAt } = await exchangeJobToken(pat, proxyOptions, signal);
-  const userId = await fetchUserIdForJobToken(jobToken, proxyOptions, signal);
-  const entry = { accessToken: jobToken, userId, expiresAt };
-  patJobCache.set(pat, entry);
-  return entry;
+  return resolveQoderCredential(pat, { proxyOptions, signal });
 }
+
+export { isQoderPat };
 
 export class QoderExecutor extends BaseExecutor {
   constructor() {

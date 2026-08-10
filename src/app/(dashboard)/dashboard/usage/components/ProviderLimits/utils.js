@@ -393,25 +393,22 @@ export function parseQuotaData(provider, data) {
         break;
 
       case "qoder":
-        // Qoder provides usage data as { quotas: { Personal: {...}, Organization: {...} } }
-        // Each quota has { total, used, remaining, unit, resetAt }
-        // The 'remaining' field is an absolute credit count, NOT a percentage.
-        // Our UI calculates percentage from used/total, so we skip forwarding 'remaining'.
+        // Qoder activity IDs are stable map keys while modelName is localized
+        // display text. Absolute `remaining` is a request count, so forward
+        // only the explicitly calculated percentage to the shared UI.
         if (data.quotas) {
           Object.entries(data.quotas).forEach(([quotaName, quota]) => {
             if (!quota) return;
 
-            // Skip empty organization quotas (not applicable for personal accounts)
-            if (quotaName === "Organization" && (Number(quota.total) || 0) === 0) {
-              return;
-            }
-
             normalizedQuotas.push({
-              name: quotaName,
+              name: quota.name || quotaName,
+              modelKey: quotaName,
               used: Number(quota.used) || 0,
               total: Number(quota.total) || 0,
               unit: quota.unit || "credits",
               resetAt: quota.resetAt || null,
+              remainingPercentage: quota.remainingPercentage,
+              recurring: quota.recurring !== false,
             });
           });
         }

@@ -11,6 +11,9 @@
 export const QODER_OPENAPI_BASE = "https://openapi.qoder.sh";
 export const QODER_CENTER_BASE = "https://center.qoder.sh";
 export const QODER_CHAT_BASE = "https://api3.qoder.sh";
+// Qoder routes short-lived job-token (jt-...) traffic through api2; api3
+// rejects otherwise-valid job-token signatures with "Login expired" (403).
+export const QODER_CHAT_BASE_ALT = "https://api2.qoder.sh";
 
 export const QODER_LOGIN_URL = "https://qoder.com/device/selectAccounts";
 
@@ -30,6 +33,8 @@ export const QODER_CHAT_SIG_PATH = "/api/v2/service/pro/sse/agent_chat_generatio
 export const QODER_CHAT_URL = `${QODER_CHAT_BASE}/algo${QODER_CHAT_SIG_PATH}?FetchKeys=llm_model_result&AgentId=agent_common`;
 export const QODER_CHAT_URL_ENCODED = `${QODER_CHAT_URL}&Encode=1`;
 export const QODER_MODEL_LIST_URL = `${QODER_CHAT_BASE}/algo/api/v2/model/list`;
+export const QODER_ACTIVITY_URL = `${QODER_CHAT_BASE}/algo/api/v2/activity`;
+export const QODER_ACTIVITY_URL_ALT = `${QODER_CHAT_BASE_ALT}/algo/api/v2/activity`;
 
 // COSY header constants. These are not arbitrary — the upstream signature
 // validation matches them against the values used at signing time.

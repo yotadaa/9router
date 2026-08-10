@@ -1,3 +1,8 @@
+import {
+  QODER_ACTIVITY_URL,
+  QODER_ACTIVITY_URL_ALT,
+} from "../../shared/qoder/constants.js";
+
 export default {
   id: "qoder",
   priority: 30,
@@ -22,7 +27,8 @@ export default {
     timeoutMs: 120000,
     stallTimeoutMs: 120000,
     usage: {
-      url: "https://openapi.qoder.sh/api/v1/quota/user",
+      url: QODER_ACTIVITY_URL,
+      jobTokenUrl: QODER_ACTIVITY_URL_ALT,
     },
   },
   models: [
@@ -47,7 +53,8 @@ export default {
     deviceTokenUrl: "https://openapi.qoder.sh/api/v1/deviceToken/poll",
     refreshUrl: "https://center.qoder.sh/algo/api/v3/user/refresh_token",
     userInfoUrl: "https://openapi.qoder.sh/api/v1/userinfo",
-    quotaUsageUrl: "https://openapi.qoder.sh/api/v2/quota/usage",
+    activityUrl: QODER_ACTIVITY_URL,
+    jobTokenActivityUrl: QODER_ACTIVITY_URL_ALT,
     loginUrl: "https://qoder.com/device/selectAccounts",
   },
   features: {
