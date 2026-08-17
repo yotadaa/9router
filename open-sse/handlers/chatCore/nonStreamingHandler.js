@@ -202,7 +202,7 @@ export function translateNonStreamingResponse(responseBody, targetFormat, source
 /**
  * Handle non-streaming response from provider.
  */
-export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, trackDone, appendLog, pxpipe, reqTag, log }) {
+export async function handleNonStreamingResponse({ providerResponse, provider, model, sourceFormat, clientResponseFormat = sourceFormat, targetFormat, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, trackDone, appendLog, pxpipe, reqTag, log }) {
   trackDone();
   const contentType = providerResponse.headers.get("content-type") || "";
   let responseBody;
@@ -242,11 +242,11 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   saveUsageStats({ provider, model, tokens: usage, connectionId, apiKey, endpoint: clientRawRequest?.endpoint, silent: true });
   if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: Date.now() - requestStartTime } }));
 
-  const translatedResponse = needsTranslation(targetFormat, sourceFormat)
-    ? translateNonStreamingResponse(responseBody, targetFormat, sourceFormat)
+  const translatedResponse = needsTranslation(targetFormat, clientResponseFormat)
+    ? translateNonStreamingResponse(responseBody, targetFormat, clientResponseFormat)
     : responseBody;
-  const isClaudeMessageResponse = sourceFormat === FORMATS.CLAUDE && translatedResponse?.type === "message";
-  const isResponsesApiResponse = sourceFormat === FORMATS.OPENAI_RESPONSES && translatedResponse?.object === "response";
+  const isClaudeMessageResponse = clientResponseFormat === FORMATS.CLAUDE && translatedResponse?.type === "message";
+  const isResponsesApiResponse = clientResponseFormat === FORMATS.OPENAI_RESPONSES && translatedResponse?.object === "response";
 
   // Fix finish_reason for tool_calls: some providers return non-standard values (e.g. "other")
   if (translatedResponse?.choices?.[0]) {
@@ -273,7 +273,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   }
 
   if (translatedResponse?.usage) {
-    translatedResponse.usage = filterUsageForFormat(addBufferToUsage(translatedResponse.usage), sourceFormat);
+    translatedResponse.usage = filterUsageForFormat(addBufferToUsage(translatedResponse.usage), clientResponseFormat);
   }
 
   // Strip reasoning_content only when content is non-empty.

@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
 import { FORMATS } from "../../open-sse/translator/formats.js";
 import { translateNonStreamingResponse } from "../../open-sse/handlers/chatCore/nonStreamingHandler.js";
+import { getClientResponseFormat } from "../../open-sse/handlers/chatCore/responseFormat.js";
 
 describe("OpenAI Chat Completions → Responses API JSON", () => {
+  it("keeps Chat Completions output until the converter is explicitly enabled", () => {
+    expect(getClientResponseFormat(FORMATS.OPENAI_RESPONSES, false)).toBe(FORMATS.OPENAI);
+    expect(getClientResponseFormat(FORMATS.OPENAI_RESPONSES, true)).toBe(FORMATS.OPENAI_RESPONSES);
+    expect(getClientResponseFormat(FORMATS.OPENAI, true)).toBe(FORMATS.OPENAI);
+  });
+
   it("converts text and usage for a non-streaming Responses API request", () => {
     const converted = translateNonStreamingResponse({
       id: "chatcmpl_123",
