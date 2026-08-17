@@ -161,7 +161,8 @@ describe("forceStream provider config", () => {
     options.clientRawRequest = {
       endpoint: "/v1/responses",
       body: options.body,
-      headers: { accept: "application/json" },
+      // Do not let the Accept-header JSON fallback mask the Responses default.
+      headers: { accept: "*/*" },
     };
     options.sourceFormatOverride = "openai-responses";
     options.responsesApiConverterEnabled = true;
