@@ -8,6 +8,14 @@ import * as log from "../utils/logger.js";
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
 
+const QODER_LIMIT_ERROR_PATTERN = /(?:limit|quota|credit|balance).*(?:reached|exceeded|exhausted|insufficient|depleted|over)|(?:reached|exceeded|exhausted|insufficient|depleted|over).*(?:limit|quota|credit|balance)/i;
+
+export function isQoderLimitReached(status, errorText) {
+  if (Number(status) === 429) return true;
+  const message = typeof errorText === "string" ? errorText : JSON.stringify(errorText || "");
+  return QODER_LIMIT_ERROR_PATTERN.test(message);
+}
+
 /**
  * Get provider credentials from localDb
  * Filters out unavailable accounts and returns the selected account based on strategy
@@ -226,6 +234,10 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
 
   const reason = typeof errorText === "string" ? errorText.slice(0, 100) : "Provider error";
   const lockUpdate = buildModelLockUpdate(model, cooldownMs);
+  const shouldDemoteQoder = provider === "qoder" && conn && isQoderLimitReached(status, errorText);
+  const lowestPriority = shouldDemoteQoder
+    ? Math.max(0, ...connections.map((connection) => Number(connection.priority) || 0)) + 1
+    : null;
 
   await updateProviderConnection(connectionId, {
     ...lockUpdate,
@@ -233,12 +245,16 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     lastError: reason,
     errorCode: status,
     lastErrorAt: new Date().toISOString(),
-    backoffLevel: newBackoffLevel ?? backoffLevel
+    backoffLevel: newBackoffLevel ?? backoffLevel,
+    ...(shouldDemoteQoder ? { priority: lowestPriority } : {})
   });
 
   const lockKey = Object.keys(lockUpdate)[0];
   const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
   log.warn("AUTH", `${connName} locked ${lockKey} for ${Math.round(cooldownMs / 1000)}s [${status}]`);
+  if (shouldDemoteQoder) {
+    log.warn("AUTH", `${connName} reached a Qoder limit and moved to the lowest priority`);
+  }
 
   if (provider && status && reason) {
     console.error(`❌ ${provider} [${status}]: ${reason}`);

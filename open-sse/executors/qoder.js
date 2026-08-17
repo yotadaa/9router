@@ -342,6 +342,121 @@ function wrapQoderSSE(response, model) {
   });
 }
 
+function parseQoderEnvelopeLine(line) {
+  const trimmed = line.replace(/\r$/, "").trim();
+  if (!trimmed.startsWith("data:")) return null;
+
+  const data = trimmed.slice(5).trimStart();
+  if (data === "[DONE]") return { status: 200, body: "[DONE]" };
+
+  try {
+    const envelope = JSON.parse(data);
+    return {
+      status: Number.isFinite(Number(envelope.statusCodeValue))
+        ? Number(envelope.statusCodeValue)
+        : 200,
+      body: typeof envelope.body === "string" ? envelope.body : "",
+    };
+  } catch {
+    return null;
+  }
+}
+
+function qoderEnvelopeErrorMessage(body, status) {
+  if (!body) return `upstream status ${status}`;
+  try {
+    const parsed = JSON.parse(body);
+    const message = parsed?.error?.message || parsed?.message || parsed?.error || parsed?.msg;
+    if (message) return typeof message === "string" ? message : JSON.stringify(message);
+  } catch { /* keep the original body */ }
+  return body;
+}
+
+function qoderHttpStatus(status, message) {
+  if (Number.isInteger(status) && status >= 400 && status <= 599) return status;
+  return /(?:limit|quota|credit|balance)/i.test(message) ? 429 : 502;
+}
+
+function responseWithPrefetchedBody(response, reader, prefetchedChunks) {
+  const body = new ReadableStream({
+    async start(controller) {
+      try {
+        for (const chunk of prefetchedChunks) controller.enqueue(chunk);
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          controller.enqueue(value);
+        }
+        controller.close();
+      } catch (error) {
+        controller.error(error);
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason).catch(() => {});
+    },
+  });
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+/**
+ * Qoder can accept an HTTP request (200) then report quota exhaustion in its
+ * first SSE envelope. Probe that first envelope before handing the stream to
+ * chatCore, so the normal credential fallback loop can select the next account.
+ */
+async function probeQoderSSEForInitialError(response) {
+  if (!response.ok || !response.body) return response;
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const prefetchedChunks = [];
+  let buffer = "";
+
+  const errorResponse = async (envelope) => {
+    await reader.cancel().catch(() => {});
+    const message = qoderEnvelopeErrorMessage(envelope.body, envelope.status);
+    const status = qoderHttpStatus(envelope.status, message);
+    return new Response(
+      JSON.stringify({ error: { message: `qoder upstream error ${envelope.status}: ${message}` } }),
+      { status, headers: { "Content-Type": "application/json" } },
+    );
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        buffer += decoder.decode();
+        const envelope = buffer ? parseQoderEnvelopeLine(buffer) : null;
+        if (envelope && envelope.status !== 200) return errorResponse(envelope);
+        return responseWithPrefetchedBody(response, reader, prefetchedChunks);
+      }
+
+      prefetchedChunks.push(value);
+      buffer += decoder.decode(value, { stream: true });
+      let newlineIndex;
+      while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, newlineIndex);
+        buffer = buffer.slice(newlineIndex + 1);
+        const envelope = parseQoderEnvelopeLine(line);
+        if (!envelope) continue;
+        if (envelope.status !== 200) return errorResponse(envelope);
+        return responseWithPrefetchedBody(response, reader, prefetchedChunks);
+      }
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    return new Response(
+      JSON.stringify({ error: { message: `qoder SSE preflight failed: ${error.message}` } }),
+      { status: 502, headers: { "Content-Type": "application/json" } },
+    );
+  }
+}
+
 // ── PAT (Personal Access Token) → job-token exchange ───────────────────────
 // PATs (pt-...) cannot sign COSY requests directly. Exchange them for a
 // short-lived job token (jt-...) via /api/v1/jobToken/exchange (plain JSON,
@@ -491,7 +606,12 @@ export class QoderExecutor extends BaseExecutor {
       return { response, url, headers, transformedBody: payload };
     }
 
-    const wrapped = wrapQoderSSE(response, `qoder/${qoderKey}`);
+    const probedResponse = await probeQoderSSEForInitialError(response);
+    if (!probedResponse.ok) {
+      return { response: probedResponse, url, headers, transformedBody: payload };
+    }
+
+    const wrapped = wrapQoderSSE(probedResponse, `qoder/${qoderKey}`);
     return { response: wrapped, url, headers, transformedBody: payload };
   }
 
@@ -514,6 +634,7 @@ export default QoderExecutor;
 export const __test__ = {
   normalizeMessages,
   wrapQoderSSE,
+  probeQoderSSEForInitialError,
   buildQoderRequestBody,
   isQoderPat,
   resolvePatCredential,

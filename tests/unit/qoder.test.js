@@ -370,7 +370,7 @@ describe("normalizeMessages", () => {
 });
 
 describe("wrapQoderSSE", () => {
-  const { wrapQoderSSE } = qoderExecutorInternals;
+  const { wrapQoderSSE, probeQoderSSEForInitialError } = qoderExecutorInternals;
 
   // Helper: build a fake Response carrying the given lines as the body.
   function makeResponse(lines, { status = 200 } = {}) {
@@ -459,6 +459,42 @@ describe("wrapQoderSSE", () => {
     const out = await drain(wrapped);
     expect(out).toContain("[qoder error 503");
     expect(out).toContain("data: [DONE]\n\n");
+  });
+
+  it("turns an initial quota envelope into an HTTP error before streaming", async () => {
+    const env = JSON.stringify({
+      statusCodeValue: 429,
+      body: JSON.stringify({ message: "daily quota limit reached" }),
+    });
+    const probed = await probeQoderSSEForInitialError(
+      makeResponse([`data: ${env}\n\n`]),
+    );
+
+    expect(probed.ok).toBe(false);
+    expect(probed.status).toBe(429);
+    expect((await probed.json()).error.message).toContain("daily quota limit reached");
+  });
+
+  it("turns an initial expired-credential envelope into HTTP 401 for fallback", async () => {
+    const env = JSON.stringify({ statusCodeValue: 401, body: "credential expired" });
+    const probed = await probeQoderSSEForInitialError(
+      makeResponse([`data: ${env}\n\n`]),
+    );
+
+    expect(probed.ok).toBe(false);
+    expect(probed.status).toBe(401);
+    expect((await probed.json()).error.message).toContain("credential expired");
+  });
+
+  it("preserves the first successful envelope after probing", async () => {
+    const inner = JSON.stringify({ choices: [{ delta: { content: "still here" } }] });
+    const env = JSON.stringify({ statusCodeValue: 200, body: inner });
+    const probed = await probeQoderSSEForInitialError(
+      makeResponse([`data: ${env}\n\n`]),
+    );
+    const out = await drain(wrapQoderSSE(probed, "qoder/auto"));
+
+    expect(out).toContain(`data: ${inner}\n\n`);
   });
 
   it("non-ok responses are returned unchanged (no transform)", () => {
