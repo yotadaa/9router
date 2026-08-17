@@ -118,6 +118,112 @@ export function openaiToOpenAIResponsesResponse(chunk, state) {
   return events;
 }
 
+/**
+ * Convert one non-streaming OpenAI Chat Completions response into an OpenAI
+ * Responses API response. Streaming requests use openaiToOpenAIResponsesResponse
+ * above; this covers providers such as Qoder that return JSON for stream:false.
+ *
+ * @param {object} completion OpenAI Chat Completions response body
+ * @returns {object} OpenAI Responses API response body
+ */
+export function openAICompletionToOpenAIResponsesResponse(completion = {}) {
+  const choice = completion.choices?.[0] || {};
+  const message = choice.message || {};
+  const createdAt = Number.isFinite(completion.created)
+    ? completion.created
+    : Math.floor(Date.now() / 1000);
+  const responseId = completion.id ? `resp_${completion.id}` : `resp_${Date.now()}`;
+  const output = [];
+
+  const reasoningText = extractReasoningText(message);
+  if (reasoningText) {
+    output.push({
+      id: `rs_${responseId}_${output.length}`,
+      type: RESPONSES_ITEM.REASONING,
+      summary: [{ type: RESPONSES_ITEM.SUMMARY_TEXT, text: reasoningText }]
+    });
+  }
+
+  const text = extractMessageText(message.content);
+  if (text || (!message.tool_calls?.length && !message.function_call)) {
+    output.push({
+      id: `msg_${responseId}_${output.length}`,
+      type: RESPONSES_ITEM.MESSAGE,
+      role: ROLE.ASSISTANT,
+      content: [{
+        type: RESPONSES_ITEM.OUTPUT_TEXT,
+        text,
+        annotations: Array.isArray(message.annotations) ? message.annotations : []
+      }]
+    });
+  }
+
+  const toolCalls = message.tool_calls || (message.function_call ? [{ function: message.function_call }] : []);
+  for (let index = 0; index < toolCalls.length; index++) {
+    const toolCall = toolCalls[index] || {};
+    const callId = toolCall.id || `call_${responseId}_${index}`;
+    output.push({
+      id: `fc_${callId}`,
+      type: RESPONSES_ITEM.FUNCTION_CALL,
+      call_id: callId,
+      name: toolCall.function?.name || toolCall.name || "",
+      arguments: stringifyToolArguments(toolCall.function?.arguments ?? toolCall.arguments)
+    });
+  }
+
+  const promptTokens = completion.usage?.prompt_tokens ?? completion.usage?.input_tokens ?? 0;
+  const completionTokens = completion.usage?.completion_tokens ?? completion.usage?.output_tokens ?? 0;
+  const cachedTokens = completion.usage?.prompt_tokens_details?.cached_tokens
+    ?? completion.usage?.input_tokens_details?.cached_tokens
+    ?? 0;
+  const reasoningTokens = completion.usage?.completion_tokens_details?.reasoning_tokens
+    ?? completion.usage?.output_tokens_details?.reasoning_tokens
+    ?? 0;
+  const totalTokens = completion.usage?.total_tokens ?? (promptTokens + completionTokens);
+  const incomplete = choice.finish_reason === OPENAI_FINISH.LENGTH;
+
+  return {
+    id: responseId,
+    object: "response",
+    created_at: createdAt,
+    status: incomplete ? "incomplete" : "completed",
+    error: null,
+    incomplete_details: incomplete ? { reason: "max_output_tokens" } : null,
+    model: completion.model || MODEL_FALLBACK,
+    output,
+    usage: {
+      input_tokens: promptTokens,
+      input_tokens_details: { cached_tokens: cachedTokens },
+      output_tokens: completionTokens,
+      output_tokens_details: { reasoning_tokens: reasoningTokens },
+      total_tokens: totalTokens
+    }
+  };
+}
+
+function extractMessageText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (part?.type === OPENAI_BLOCK.TEXT || part?.type === RESPONSES_ITEM.OUTPUT_TEXT) return part.text || "";
+      return "";
+    })
+    .join("");
+}
+
+function stringifyToolArguments(argumentsValue) {
+  if (typeof argumentsValue === "string") return argumentsValue;
+  if (argumentsValue === undefined || argumentsValue === null) return "{}";
+  try {
+    return JSON.stringify(argumentsValue);
+  } catch {
+    return "{}";
+  }
+}
+
 // Helper functions
 function startReasoning(state, emit, idx) {
   if (!state.reasoningId) {
