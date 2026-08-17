@@ -10,6 +10,7 @@ import { buildRequestDetail, extractRequestConfig, extractUsageFromResponse, sav
 import { appendRequestLog, saveRequestDetail } from "@/lib/usageDb.js";
 import { decloakToolNames } from "../../utils/claudeCloaking.js";
 import { openAICompletionToOpenAIResponsesResponse } from "../../translator/response/openai-responses.js";
+import { storeResponsesContinuation } from "../../services/responsesContinuation.js";
 
 function parseToolArguments(value) {
   if (!value) return {};
@@ -64,10 +65,10 @@ function openAICompletionToClaudeMessage(responseBody) {
 /**
  * Translate non-streaming response body from provider format → OpenAI format.
  */
-export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat) {
+export function translateNonStreamingResponse(responseBody, targetFormat, sourceFormat, request = {}) {
   if (targetFormat === sourceFormat) return responseBody;
   if (targetFormat === FORMATS.OPENAI && sourceFormat === FORMATS.OPENAI_RESPONSES) {
-    return openAICompletionToOpenAIResponsesResponse(responseBody);
+    return openAICompletionToOpenAIResponsesResponse(responseBody, request);
   }
   if (targetFormat === FORMATS.OPENAI && sourceFormat === FORMATS.CLAUDE) {
     return openAICompletionToClaudeMessage(responseBody);
@@ -243,7 +244,7 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
   if (log?.line) log.line(reqTag, "📊", formatDoneLine({ usage, latency: { total: Date.now() - requestStartTime } }));
 
   const translatedResponse = needsTranslation(targetFormat, clientResponseFormat)
-    ? translateNonStreamingResponse(responseBody, targetFormat, clientResponseFormat)
+    ? translateNonStreamingResponse(responseBody, targetFormat, clientResponseFormat, body)
     : responseBody;
   const isClaudeMessageResponse = clientResponseFormat === FORMATS.CLAUDE && translatedResponse?.type === "message";
   const isResponsesApiResponse = clientResponseFormat === FORMATS.OPENAI_RESPONSES && translatedResponse?.object === "response";
@@ -272,8 +273,12 @@ export async function handleNonStreamingResponse({ providerResponse, provider, m
     }
   }
 
-  if (translatedResponse?.usage) {
+  if (translatedResponse?.usage && !isResponsesApiResponse) {
     translatedResponse.usage = filterUsageForFormat(addBufferToUsage(translatedResponse.usage), clientResponseFormat);
+  }
+
+  if (isResponsesApiResponse && targetFormat === FORMATS.OPENAI) {
+    storeResponsesContinuation(translatedResponse, body, apiKey);
   }
 
   // Strip reasoning_content only when content is non-empty.

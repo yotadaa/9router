@@ -200,6 +200,9 @@ export function openaiResponsesToOpenAIRequest(model, body, stream, credentials)
   delete result.include;
   delete result.prompt_cache_key;
   delete result.store;
+  // Chat Completions backends cannot resolve synthetic Responses IDs. When
+  // continuation is supported, chatCore has already expanded it into input[].
+  delete result.previous_response_id;
   if (typeof result.reasoning?.effort === "string") {
     result.reasoning_effort = result.reasoning.effort;
   }

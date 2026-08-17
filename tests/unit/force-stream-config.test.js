@@ -71,6 +71,8 @@ vi.mock("../../open-sse/rtk/index.js", () => ({
 vi.mock("../../open-sse/rtk/headroom.js", () => ({
   compressWithHeadroom: vi.fn(async () => null),
   formatHeadroomLog: vi.fn(() => ""),
+  formatHeadroomSizeLog: vi.fn(() => ""),
+  isHeadroomPhantomSavings: vi.fn(() => false),
 }));
 
 vi.mock("../../open-sse/providers/capabilities.js", () => ({
@@ -149,5 +151,24 @@ describe("forceStream provider config", () => {
 
     expect(executeMock).toHaveBeenCalledTimes(1);
     expect(executeMock.mock.calls[0][0].stream).toBe(true);
+  });
+
+  it("uses the Responses API non-streaming default for a Chat Completions backend", async () => {
+    const { handleChatCore } = await import("../../open-sse/handlers/chatCore.js");
+    const options = makeOptions();
+    options.body = { model: "qd/qmodel_38max", input: "hello" };
+    options.modelInfo = { provider: "qoder", model: "qmodel_38max" };
+    options.clientRawRequest = {
+      endpoint: "/v1/responses",
+      body: options.body,
+      headers: { accept: "application/json" },
+    };
+    options.sourceFormatOverride = "openai-responses";
+    options.responsesApiConverterEnabled = true;
+
+    await handleChatCore(options);
+
+    expect(executeMock).toHaveBeenCalledTimes(1);
+    expect(executeMock.mock.calls[0][0].stream).toBe(false);
   });
 });

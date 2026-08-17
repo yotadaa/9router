@@ -35,6 +35,7 @@ describe("OpenAI Chat Completions → Responses API JSON", () => {
       object: "response",
       created_at: 1_746_000_000,
       status: "completed",
+      background: false,
       error: null,
       model: "qmodel_38max",
       output: [{

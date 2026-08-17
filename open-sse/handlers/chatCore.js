@@ -31,6 +31,7 @@ import { stripUnsupportedModalities } from "../translator/concerns/modality.js";
 import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
 import { extractThinking } from "../translator/concerns/thinkingUnified.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
+import { expandResponsesContinuation } from "../services/responsesContinuation.js";
 
 /**
  * Core chat handler - shared between SSE and Worker
@@ -68,6 +69,21 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   const stripList = getModelStrip(alias, model);
   const upstreamModel = getModelUpstreamId(alias, model);
 
+  // A Chat Completions backend cannot resolve previous_response_id. Replay the
+  // router-owned Responses history before translating it into messages[].
+  if (
+    sourceFormat === FORMATS.OPENAI_RESPONSES
+    && clientResponseFormat === FORMATS.OPENAI_RESPONSES
+    && targetFormat === FORMATS.OPENAI
+    && body.previous_response_id
+  ) {
+    const continuation = expandResponsesContinuation(body, apiKey);
+    if (continuation.error) {
+      return createErrorResult(HTTP_STATUS.BAD_REQUEST, continuation.error);
+    }
+    body = continuation.body;
+  }
+
   // Inject provider-level thinking config override (only if client hasn't set)
   // on/off → extended type (body.thinking), none/low/medium/high → effort type (body.reasoning_effort)
   if (providerThinking?.mode && providerThinking.mode !== "auto") {
@@ -84,7 +100,13 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
 
   const clientRequestedStreaming = body.stream === true || sourceFormat === FORMATS.ANTIGRAVITY || sourceFormat === FORMATS.GEMINI || sourceFormat === FORMATS.GEMINI_CLI;
   const providerRequiresStreaming = PROVIDERS[provider]?.forceStream === true;
-  let stream = providerRequiresStreaming ? true : (body.stream !== false);
+  // Responses creates are JSON by default; Chat Completions has historically
+  // defaulted to streaming in this router. Preserve the latter while honoring
+  // the Responses API contract when the caller omits `stream`.
+  const defaultStream = sourceFormat === FORMATS.OPENAI_RESPONSES ? false : true;
+  let stream = providerRequiresStreaming
+    ? true
+    : (body.stream === undefined ? defaultStream : body.stream === true);
 
   // Image generation models require non-streaming (Google v1internal:generateContent)
   const modelType = getModelType(alias, model);
